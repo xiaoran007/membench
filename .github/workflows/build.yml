@@ -15,7 +15,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     
     - name: Install dependencies (Ubuntu)
       if: runner.os == 'Linux'
@@ -43,9 +43,10 @@ jobs:
       run: .\build\Release\membench.exe 32
     
     - name: Upload artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: membench-${{ matrix.os }}
         path: |
           build/membench
           build/Release/membench.exe
+        if-no-files-found: ignore
