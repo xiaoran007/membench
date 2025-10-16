@@ -1,0 +1,51 @@
+name: Cross-Platform Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        
+    runs-on: ${{ matrix.os }}
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Install dependencies (Ubuntu)
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake build-essential
+    
+    - name: Install dependencies (macOS)
+      if: runner.os == 'macOS'
+      run: |
+        brew install cmake
+    
+    - name: Configure CMake
+      run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+    
+    - name: Build
+      run: cmake --build build --config Release
+    
+    - name: Test run (Linux/macOS)
+      if: runner.os != 'Windows'
+      run: ./build/membench 32
+      
+    - name: Test run (Windows)
+      if: runner.os == 'Windows'
+      run: .\build\Release\membench.exe 32
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: membench-${{ matrix.os }}
+        path: |
+          build/membench
+          build/Release/membench.exe
