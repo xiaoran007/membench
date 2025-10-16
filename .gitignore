@@ -1,3 +1,8 @@
+DS_Store
+.idea
+.vscode
+build
+
 # Prerequisites
 *.d
 
