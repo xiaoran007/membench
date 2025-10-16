@@ -11,6 +11,8 @@
 #include <iomanip>
 #include <algorithm>
 #include <random>
+#include <string>
+#include <sstream>
 
 #ifdef _WIN32
     #include <windows.h>
@@ -87,10 +89,10 @@ public:
         // Initialize with random data
         std::random_device rd;
         std::mt19937 gen(rd());
-        std::uniform_int_distribution<> dis(0, 255);
+        std::uniform_int_distribution<int> dis(0, 255);
         
         for (auto& byte : buffer1) {
-            byte = dis(gen);
+            byte = static_cast<uint8_t>(dis(gen));
         }
     }
 
@@ -455,8 +457,16 @@ int main(int argc, char* argv[]) {
     size_t bufferSize = 64 * 1024 * 1024; // Default 64MB
     if (argc > 1) {
         try {
-            bufferSize = std::stoull(argv[1]) * 1024 * 1024; // Convert MB to bytes
-            std::cout << "Using custom buffer size: " << bufferSize / (1024 * 1024) << " MB" << std::endl;
+            // Use stringstream for better cross-platform compatibility
+            std::stringstream ss(argv[1]);
+            unsigned long long sizeMB = 0;
+            ss >> sizeMB;
+            if (!ss.fail() && sizeMB > 0 && sizeMB <= 10240) { // Max 10GB
+                bufferSize = sizeMB * 1024 * 1024; // Convert MB to bytes
+                std::cout << "Using custom buffer size: " << bufferSize / (1024 * 1024) << " MB" << std::endl;
+            } else {
+                std::cerr << "Invalid buffer size (must be 1-10240 MB), using default 64MB" << std::endl;
+            }
         } catch (...) {
             std::cerr << "Invalid buffer size argument, using default 64MB" << std::endl;
         }
