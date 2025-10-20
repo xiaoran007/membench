@@ -161,11 +161,55 @@ private:
 #endif
     }
 
+    // Determine optimal thread count for memory benchmarking
+    static unsigned int getOptimalThreadCount() {
+        unsigned int hw_threads = std::thread::hardware_concurrency();
+        if (hw_threads == 0) {
+            return 1;  // Fallback if unable to detect
+        }
+        
+        // For memory bandwidth tests, using too many threads can cause:
+        // 1. Memory controller saturation (diminishing returns)
+        // 2. Cache coherency overhead
+        // 3. System instability on high-core-count machines
+        
+        // Strategy:
+        // - For <= 8 cores: use all cores (typical consumer CPUs)
+        // - For 9-16 cores: use 75% of cores
+        // - For 17-32 cores: use 50% of cores
+        // - For 33-64 cores: use 25% of cores (16 threads max)
+        // - For > 64 cores: cap at 16-24 threads
+        
+        unsigned int optimal;
+        if (hw_threads <= 8) {
+            optimal = hw_threads;
+        } else if (hw_threads <= 16) {
+            // optimal = hw_threads;  // not change
+            optimal = 8;
+        } else if (hw_threads <= 32) {
+            // optimal = hw_threads / 2;  // 50%
+            optimal = 8;
+        } else if (hw_threads <= 64) {
+            // optimal = hw_threads / 4;  // 25%, max 16
+            optimal = 8;
+        } else {
+            // For very high core count (>64), cap at 16-24 threads
+            // optimal = std::min(24u, hw_threads / 4);
+            optimal = 8;
+        }
+        
+        // Ensure at least 1 thread
+        if (optimal < 1) optimal = 1;
+        
+        std::cout << "Hardware threads detected: " << hw_threads 
+                  << ", using " << optimal << " threads for benchmark" << std::endl;
+        
+        return optimal;
+    }
+
 public:
     MemoryBenchmark(size_t size = DEFAULT_SIZE) 
-        : num_threads(std::thread::hardware_concurrency()) {
-        if (num_threads == 0) num_threads = 1;
-        
+        : num_threads(getOptimalThreadCount()) {
         std::cout << "Allocating " << size / MB << " MB (" << size / GB << " GB) memory buffers..." << std::endl;
         buffer1.resize(size);
         buffer2.resize(size);
