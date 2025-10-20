@@ -36,11 +36,11 @@ jobs:
     
     - name: Test run (Linux/macOS)
       if: runner.os != 'Windows'
-      run: ./build/membench 32
+      run: ./build/membench 512
       
     - name: Test run (Windows)
       if: runner.os == 'Windows'
-      run: .\build\Release\membench.exe 32
+      run: .\build\Release\membench.exe 512
     
     - name: Upload artifacts
       uses: actions/upload-artifact@v4

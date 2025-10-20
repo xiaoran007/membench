@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.10)
-project(membench VERSION 0.1.0 LANGUAGES CXX)
+project(membench VERSION 0.2.0 LANGUAGES CXX)
+
+# Configure version header
+configure_file(
+    "${PROJECT_SOURCE_DIR}/src/version.h.in"
+    "${PROJECT_BINARY_DIR}/version.h"
+)
 
 # Set C++ standard
 set(CMAKE_CXX_STANDARD 17)
@@ -33,6 +39,9 @@ endif()
 
 # Add executable
 add_executable(membench src/membench.cpp)
+
+# Include binary directory for generated version.h
+target_include_directories(membench PRIVATE ${PROJECT_BINARY_DIR})
 
 # Link libraries
 if(UNIX AND NOT APPLE)
