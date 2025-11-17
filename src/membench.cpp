@@ -1,6 +1,6 @@
 /**
  * Memory Benchmark Tool
- * Tests memory read, write, copy speed and latency
+ * Tests memory read, write, copy speed
  * Cross-platform support: Linux, macOS, Windows
  */
 
@@ -47,7 +47,6 @@ private:
     static constexpr size_t DEFAULT_SIZE = 2 * GB;  // Increased to 2GB to exceed LLC
     static constexpr size_t ITERATIONS = 10;
     static constexpr size_t INNER_ITERATIONS = 5;  // Reduced inner iterations due to larger dataset
-    static constexpr size_t LATENCY_ITERATIONS = 1000000;
     static constexpr size_t CACHE_LINE_SIZE = 64;
     static constexpr size_t UNROLL_FACTOR = 16;
 
@@ -92,11 +91,6 @@ private:
     double calculateBandwidth(size_t bytes, Duration duration) {
         double seconds = std::chrono::duration<double>(duration).count();
         return (bytes / (1024.0 * 1024.0)) / seconds;
-    }
-
-    // Calculate latency in nanoseconds
-    double calculateLatency(size_t iterations, Duration duration) {
-        return std::chrono::duration<double, std::nano>(duration).count() / iterations;
     }
 
     // Set thread affinity and priority
@@ -448,45 +442,6 @@ public:
         }
         
         printStatistics(bandwidths);
-    }
-
-    // Random access latency test
-    void testRandomAccessLatency() {
-        std::cout << "\n=== Random Access Latency Test ===" << std::endl;
-        std::cout << "Iterations: " << LATENCY_ITERATIONS << std::endl;
-        
-        // Generate random indices
-        std::vector<size_t> indices(LATENCY_ITERATIONS);
-        std::random_device rd;
-        std::mt19937 gen(rd());
-        std::uniform_int_distribution<size_t> dis(0, buffer1.size() - 1);
-        
-        for (auto& idx : indices) {
-            idx = dis(gen);
-        }
-        
-        std::vector<double> latencies;
-        
-        for (size_t iter = 0; iter < 5; ++iter) {
-            volatile uint8_t value = 0;
-            auto start = now();
-            
-            for (size_t i = 0; i < LATENCY_ITERATIONS; ++i) {
-                value = buffer1[indices[i]];
-            }
-            
-            auto end = now();
-            auto duration = std::chrono::duration_cast<Duration>(end - start);
-            double latency = calculateLatency(LATENCY_ITERATIONS, duration);
-            latencies.push_back(latency);
-            
-            doNotOptimize(value);
-        }
-        
-        std::cout << std::fixed << std::setprecision(2);
-        std::cout << "Average latency: " << calculateAverage(latencies) << " ns" << std::endl;
-        std::cout << "Min latency: " << *std::min_element(latencies.begin(), latencies.end()) << " ns" << std::endl;
-        std::cout << "Max latency: " << *std::max_element(latencies.begin(), latencies.end()) << " ns" << std::endl;
     }
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
@@ -945,12 +900,6 @@ int main(int argc, char* argv[]) {
     // benchmark.testStreamingWriteNEON();
 #endif
     
-    // std::cout << "\n╔═══════════════════════════════════════════════════╗" << std::endl;
-    // std::cout << "║          LATENCY TEST                             ║" << std::endl;
-    // std::cout << "╚═══════════════════════════════════════════════════╝" << std::endl;
-    
-    benchmark.testRandomAccessLatency();
-
     // std::cout << "\n╔═══════════════════════════════════════════════════╗" << std::endl;
     // std::cout << "║          BENCHMARK COMPLETE                       ║" << std::endl;
     // std::cout << "╚═══════════════════════════════════════════════════╝" << std::endl;
