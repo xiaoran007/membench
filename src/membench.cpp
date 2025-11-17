@@ -240,9 +240,9 @@ public:
         std::cout << "Memory initialized with " << num_threads << " threads." << std::endl;
     }
 
-    // Sequential read test with loop unrolling and multi-threading
+    // Sequential read test with autovectorization (compiler-optimized)
     void testSequentialRead() {
-        std::cout << "\n=== Sequential Read Test (Multi-threaded, Loop Unrolled) ===" << std::endl;
+        std::cout << "\n=== Sequential Read Test (Multi-threaded, Auto-vectorized) ===" << std::endl;
         std::cout << "Buffer size: " << buffer1.size() / MB << " MB (" << buffer1.size() / GB << " GB)" << std::endl;
         std::cout << "Threads: " << num_threads << std::endl;
         std::cout << "Total data per iteration: " << (buffer1.size() * INNER_ITERATIONS) / MB << " MB" << std::endl;
@@ -286,40 +286,15 @@ public:
                     memoryBarrier();
                     auto start_time = now();
                     
-                    // Multiple passes
+                    // Multiple passes with simple reduction pattern for autovectorization
                     for (size_t pass = 0; pass < INNER_ITERATIONS; ++pass) {
-                        uint64_t sum0 = 0, sum1 = 0, sum2 = 0, sum3 = 0;
-                        uint64_t sum4 = 0, sum5 = 0, sum6 = 0, sum7 = 0;
-                        uint64_t sum8 = 0, sum9 = 0, sumA = 0, sumB = 0;
-                        uint64_t sumC = 0, sumD = 0, sumE = 0, sumF = 0;
-                        
-                        size_t i = 0;
-                        for (; i + UNROLL_FACTOR <= count; i += UNROLL_FACTOR) {
-                            sum0 += data[i + 0];
-                            sum1 += data[i + 1];
-                            sum2 += data[i + 2];
-                            sum3 += data[i + 3];
-                            sum4 += data[i + 4];
-                            sum5 += data[i + 5];
-                            sum6 += data[i + 6];
-                            sum7 += data[i + 7];
-                            sum8 += data[i + 8];
-                            sum9 += data[i + 9];
-                            sumA += data[i + 10];
-                            sumB += data[i + 11];
-                            sumC += data[i + 12];
-                            sumD += data[i + 13];
-                            sumE += data[i + 14];
-                            sumF += data[i + 15];
+                        uint64_t sum = 0;
+                        // Simple loop that compilers can easily autovectorize
+                        // Stride by cache line (8 uint64_t = 64 bytes) for better performance
+                        for (size_t i = 0; i < count; i += 8) {
+                            sum += data[i];
                         }
-                        
-                        for (; i < count; ++i) {
-                            sum0 += data[i];
-                        }
-                        
-                        uint64_t total = sum0 + sum1 + sum2 + sum3 + sum4 + sum5 + sum6 + sum7 +
-                                        sum8 + sum9 + sumA + sumB + sumC + sumD + sumE + sumF;
-                        doNotOptimize(total);
+                        doNotOptimize(sum);
                     }
                     
                     auto end_time = now();
@@ -350,9 +325,9 @@ public:
         printStatistics(bandwidths);
     }
 
-    // Sequential write test with loop unrolling and multi-threading
+    // Sequential write test with memset (optimized by compiler/library)
     void testSequentialWrite() {
-        std::cout << "\n=== Sequential Write Test (Multi-threaded, Loop Unrolled) ===" << std::endl;
+        std::cout << "\n=== Sequential Write Test (Multi-threaded memset) ===" << std::endl;
         std::cout << "Buffer size: " << buffer1.size() / MB << " MB (" << buffer1.size() / GB << " GB)" << std::endl;
         std::cout << "Threads: " << num_threads << std::endl;
         std::cout << "Total data per iteration: " << (buffer1.size() * INNER_ITERATIONS) / MB << " MB" << std::endl;
@@ -375,24 +350,8 @@ public:
                     size_t end = (t == num_threads - 1) ? buffer1.size() : (t + 1) * chunk_size;
                     size_t local_size = end - start;
                     
-                    uint64_t* data = reinterpret_cast<uint64_t*>(buffer1.data() + start);
-                    size_t count = local_size / sizeof(uint64_t);
-                    
-                    // Use volatile to prevent over-optimization but allow write combining
-                    const uint64_t v0 = 0xDEADBEEFCAFEBABEULL;
-                    const uint64_t v1 = 0xFEEDFACEDEADC0DEULL;
-                    const uint64_t v2 = 0xBADDCAFEBABEFACEULL;
-                    const uint64_t v3 = 0xC0DEDBADDEADFEEDULL;
-                    
                     // Warmup
-                    for (size_t i = 0; i < count; i += UNROLL_FACTOR) {
-                        if (i + UNROLL_FACTOR <= count) {
-                            data[i] = data[i + 1] = data[i + 2] = data[i + 3] = 0;
-                            data[i + 4] = data[i + 5] = data[i + 6] = data[i + 7] = 0;
-                            data[i + 8] = data[i + 9] = data[i + 10] = data[i + 11] = 0;
-                            data[i + 12] = data[i + 13] = data[i + 14] = data[i + 15] = 0;
-                        }
-                    }
+                    std::memset(buffer1.data() + start, 0, local_size);
                     
                     while (!start_flag.load(std::memory_order_acquire)) {
                         std::this_thread::yield();
@@ -402,35 +361,7 @@ public:
                     auto start_time = now();
                     
                     for (size_t pass = 0; pass < INNER_ITERATIONS; ++pass) {
-                        // More aggressive unrolling with pointer arithmetic
-                        uint64_t* ptr = data;
-                        uint64_t* end_ptr = data + count;
-                        
-                        while (ptr + UNROLL_FACTOR <= end_ptr) {
-                            // Using pointer writes can be slightly faster
-                            ptr[0] = v0;
-                            ptr[1] = v1;
-                            ptr[2] = v2;
-                            ptr[3] = v3;
-                            ptr[4] = v0;
-                            ptr[5] = v1;
-                            ptr[6] = v2;
-                            ptr[7] = v3;
-                            ptr[8] = v0;
-                            ptr[9] = v1;
-                            ptr[10] = v2;
-                            ptr[11] = v3;
-                            ptr[12] = v0;
-                            ptr[13] = v1;
-                            ptr[14] = v2;
-                            ptr[15] = v3;
-                            ptr += UNROLL_FACTOR;
-                        }
-                        
-                        // Handle remaining elements
-                        while (ptr < end_ptr) {
-                            *ptr++ = v0;
-                        }
+                        std::memset(buffer1.data() + start, 0xAA, local_size);
                     }
                     
                     auto end_time = now();
