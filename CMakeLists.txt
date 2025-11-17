@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(membench VERSION 0.2.0 LANGUAGES CXX)
+project(membench VERSION 0.3.0 LANGUAGES CXX)
 
 # Configure version header
 configure_file(
