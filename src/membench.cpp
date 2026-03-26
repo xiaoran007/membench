@@ -1,546 +1,966 @@
-/**
- * Memory Benchmark Tool
- * Tests memory read, write, copy speed
- * Cross-platform support: Linux, macOS, Windows
- */
-
 #include "version.h"
-#include <iostream>
-#include <vector>
-#include <chrono>
-#include <cstring>
-#include <iomanip>
+
 #include <algorithm>
-#include <random>
-#include <string>
-#include <sstream>
-#include <thread>
 #include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <exception>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <mutex>
 #include <numeric>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
 
 #ifdef _WIN32
-    #include <windows.h>
-    #include <intrin.h>
+#include <malloc.h>
+#include <windows.h>
+#include <intrin.h>
 #else
-    #include <unistd.h>
-    #include <pthread.h>
-    #if defined(__x86_64__) || defined(__i386__)
-        #include <x86intrin.h>
-    #elif defined(__aarch64__) || defined(__arm__)
-        #include <arm_neon.h>
-    #endif
-    #if defined(__linux__)
-        #include <sched.h>
-        #include <sys/resource.h>
-    #elif defined(__APPLE__)
-        #include <mach/thread_policy.h>
-        #include <mach/thread_act.h>
-        #include <sys/resource.h>
-    #endif
+#include <pthread.h>
+#include <time.h>
+#include <unistd.h>
 #endif
 
-class MemoryBenchmark {
-private:
-    static constexpr size_t KB = 1024;
-    static constexpr size_t MB = 1024 * KB;
-    static constexpr size_t GB = 1024 * MB;
-    static constexpr size_t DEFAULT_SIZE = 2 * GB;  // Increased to 2GB to exceed LLC
-    static constexpr size_t ITERATIONS = 10;
-    static constexpr size_t INNER_ITERATIONS = 5;  // Reduced inner iterations due to larger dataset
-    static constexpr size_t CACHE_LINE_SIZE = 64;
-    static constexpr size_t UNROLL_FACTOR = 16;
-
-    std::vector<uint8_t> buffer1;
-    std::vector<uint8_t> buffer2;
-    unsigned int num_threads;
-
-    // High-resolution timer
-    using Clock = std::chrono::high_resolution_clock;
-    using TimePoint = std::chrono::time_point<Clock>;
-    using Duration = std::chrono::nanoseconds;
-
-    // Prevent compiler optimization
-    template<typename T>
-    inline void doNotOptimize(T const& value) {
-#if defined(__clang__) || defined(__GNUC__)
-        asm volatile("" : : "r,m"(value) : "memory");
-#else
-        // For MSVC
-        _ReadWriteBarrier();
-        volatile T tmp = value;
-        _ReadWriteBarrier();
-        (void)tmp;
+#ifdef __APPLE__
+#include <sys/sysctl.h>
 #endif
-    }
-    
-    // Memory barrier to prevent reordering
-    inline void memoryBarrier() {
-#if defined(__clang__) || defined(__GNUC__)
-        asm volatile("" : : : "memory");
-#else
-        _ReadWriteBarrier();
-#endif
-    }
 
-    // Get current timestamp
-    TimePoint now() {
-        return Clock::now();
-    }
+namespace {
 
-    // Calculate bandwidth in MB/s
-    double calculateBandwidth(size_t bytes, Duration duration) {
-        double seconds = std::chrono::duration<double>(duration).count();
-        return (bytes / (1024.0 * 1024.0)) / seconds;
-    }
+constexpr std::size_t KB = 1024;
+constexpr std::size_t MB = 1024 * KB;
+constexpr std::size_t GB = 1024 * MB;
+constexpr std::size_t kCacheLineSize = 64;
+constexpr std::size_t kDefaultWarmupIterations = 2;
+constexpr std::size_t kDefaultMeasuredIterations = 7;
+constexpr std::size_t kMinDefaultBufferSize = 256 * MB;
+constexpr std::size_t kMaxDefaultBufferSize = 1 * GB;
+constexpr std::size_t kMaxBufferSize = 16 * GB;
 
-    // Set thread affinity and priority
-    bool setThreadAffinity(unsigned int core_id) {
-#if defined(__linux__)
-        cpu_set_t cpuset;
-        CPU_ZERO(&cpuset);
-        CPU_SET(core_id, &cpuset);
-        pthread_t current_thread = pthread_self();
-        return pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset) == 0;
-#elif defined(__APPLE__)
-        // macOS thread affinity is different and often fails
-        // Use affinity tag instead (groups threads that should run together)
-        thread_affinity_policy_data_t policy = { static_cast<integer_t>(core_id + 1) };
-        thread_port_t mach_thread = pthread_mach_thread_np(pthread_self());
-        kern_return_t result = thread_policy_set(mach_thread, THREAD_AFFINITY_POLICY,
-                                                (thread_policy_t)&policy, 
-                                                THREAD_AFFINITY_POLICY_COUNT);
-        return result == KERN_SUCCESS;
-#elif defined(_WIN32)
-        DWORD_PTR mask = 1ULL << core_id;
-        return SetThreadAffinityMask(GetCurrentThread(), mask) != 0;
-#else
-        (void)core_id;
+enum class TestKind {
+    Read,
+    Write,
+    Copy,
+};
+
+enum class ThreadPolicy {
+    Perf,
+    All,
+};
+
+struct PlatformInfo {
+    std::size_t page_size = 4096;
+    std::uint64_t physical_memory_bytes = 0;
+    unsigned int hardware_threads = 1;
+    unsigned int performance_cores = 0;
+    bool apple_silicon = false;
+};
+
+struct BenchmarkOptions {
+    std::size_t size_bytes = 0;
+    std::size_t warmup_iterations = kDefaultWarmupIterations;
+    std::size_t measured_iterations = kDefaultMeasuredIterations;
+    unsigned int threads_override = 0;
+    ThreadPolicy thread_policy = ThreadPolicy::All;
+    bool use_qos = false;
+    std::vector<TestKind> tests;
+};
+
+struct Statistics {
+    double average = 0.0;
+    double median = 0.0;
+    double minimum = 0.0;
+    double maximum = 0.0;
+    double stdev = 0.0;
+};
+
+struct TestResult {
+    Statistics bandwidth_mb_per_sec;
+    Statistics elapsed_ms;
+    std::vector<double> bandwidth_samples_mb_per_sec;
+    std::vector<double> elapsed_samples_ms;
+};
+
+std::string formatBytes(std::uint64_t bytes) {
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(2);
+    if (bytes >= GB) {
+        oss << (bytes / static_cast<double>(GB)) << " GiB";
+    } else if (bytes >= MB) {
+        oss << (bytes / static_cast<double>(MB)) << " MiB";
+    } else if (bytes >= KB) {
+        oss << (bytes / static_cast<double>(KB)) << " KiB";
+    } else {
+        oss << bytes << " B";
+    }
+    return oss.str();
+}
+
+std::string testKindToCliName(TestKind kind) {
+    switch (kind) {
+        case TestKind::Read:
+            return "read";
+        case TestKind::Write:
+            return "write";
+        case TestKind::Copy:
+            return "copy";
+    }
+    return "unknown";
+}
+
+std::string testKindToTitle(TestKind kind) {
+    switch (kind) {
+        case TestKind::Read:
+            return "Sequential Read";
+        case TestKind::Write:
+            return "Sequential Write";
+        case TestKind::Copy:
+            return "Memory Copy";
+    }
+    return "Unknown";
+}
+
+std::string threadPolicyToString(ThreadPolicy policy) {
+    return policy == ThreadPolicy::Perf ? "perf" : "all";
+}
+
+bool parseUnsigned64(const std::string& text, std::uint64_t* value) {
+    if (value == nullptr || text.empty()) {
         return false;
-#endif
     }
 
-    // Set high priority (not real-time to avoid system issues)
-    bool setHighPriority() {
-#if defined(__linux__)
-        // Use nice value instead of real-time for better compatibility
-        return setpriority(PRIO_PROCESS, 0, -20) == 0;
-#elif defined(__APPLE__)
-        // Set time constraint policy for better scheduling
-        thread_time_constraint_policy_data_t policy;
-        policy.period = 0;
-        policy.computation = 0;
-        policy.constraint = 0;
-        policy.preemptible = 1;
-        
-        thread_port_t mach_thread = pthread_mach_thread_np(pthread_self());
-        kern_return_t result = thread_policy_set(mach_thread,
-                                                THREAD_TIME_CONSTRAINT_POLICY,
-                                                (thread_policy_t)&policy,
-                                                THREAD_TIME_CONSTRAINT_POLICY_COUNT);
-        
-        // If that fails, just try to increase priority
-        if (result != KERN_SUCCESS) {
-            struct sched_param param;
-            param.sched_priority = sched_get_priority_max(SCHED_OTHER);
-            return pthread_setschedparam(pthread_self(), SCHED_OTHER, &param) == 0;
-        }
-        return result == KERN_SUCCESS;
-#elif defined(_WIN32)
-        if (!SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS)) {
+    std::size_t consumed = 0;
+    try {
+        const auto parsed = std::stoull(text, &consumed, 10);
+        if (consumed != text.size()) {
             return false;
         }
-        return SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) != 0;
-#else
+        *value = parsed;
+        return true;
+    } catch (...) {
         return false;
-#endif
+    }
+}
+
+bool parseThreadPolicy(const std::string& text, ThreadPolicy* policy) {
+    if (policy == nullptr) {
+        return false;
+    }
+    if (text == "perf") {
+        *policy = ThreadPolicy::Perf;
+        return true;
+    }
+    if (text == "all") {
+        *policy = ThreadPolicy::All;
+        return true;
+    }
+    return false;
+}
+
+bool parseTestList(const std::string& text, std::vector<TestKind>* tests) {
+    if (tests == nullptr || text.empty()) {
+        return false;
     }
 
-    // Determine optimal thread count for memory benchmarking
-    static unsigned int getOptimalThreadCount() {
-        unsigned int hw_threads = std::thread::hardware_concurrency();
-        if (hw_threads == 0) {
-            return 1;  // Fallback if unable to detect
-        }
-        
-        // For memory bandwidth tests, using too many threads can cause:
-        // 1. Memory controller saturation (diminishing returns)
-        // 2. Cache coherency overhead
-        // 3. System instability on high-core-count machines
-        
-        // Strategy:
-        // - For <= 8 cores: use all cores (typical consumer CPUs)
-        // - For 9-16 cores: use 75% of cores
-        // - For 17-32 cores: use 50% of cores
-        // - For 33-64 cores: use 25% of cores (16 threads max)
-        // - For > 64 cores: cap at 16-24 threads
-        
-        unsigned int optimal;
-        if (hw_threads <= 8) {
-            optimal = hw_threads;
-        } else if (hw_threads <= 16) {
-            // optimal = hw_threads;  // not change
-            optimal = 8;
-        } else if (hw_threads <= 32) {
-            // optimal = hw_threads / 2;  // 50%
-            optimal = 8;
-        } else if (hw_threads <= 64) {
-            // optimal = hw_threads / 4;  // 25%, max 16
-            optimal = 8;
+    std::vector<TestKind> parsed;
+    std::stringstream stream(text);
+    std::string item;
+    while (std::getline(stream, item, ',')) {
+        if (item == "read") {
+            parsed.push_back(TestKind::Read);
+        } else if (item == "write") {
+            parsed.push_back(TestKind::Write);
+        } else if (item == "copy") {
+            parsed.push_back(TestKind::Copy);
         } else {
-            // For very high core count (>64), cap at 16-24 threads
-            // optimal = std::min(24u, hw_threads / 4);
-            optimal = 8;
+            return false;
         }
-        
-        // Ensure at least 1 thread
-        if (optimal < 1) optimal = 1;
-        
-        std::cout << "Hardware threads detected: " << hw_threads 
-                  << ", using " << optimal << " threads for benchmark" << std::endl;
-        
-        return optimal;
     }
 
-public:
-    MemoryBenchmark(size_t size = DEFAULT_SIZE) 
-        : num_threads(getOptimalThreadCount()) {
-        std::cout << "Allocating " << size / MB << " MB (" << size / GB << " GB) memory buffers..." << std::endl;
-        buffer1.resize(size);
-        buffer2.resize(size);
-        
-        // Initialize with random data in parallel
-        std::vector<std::thread> init_threads;
-        size_t chunk_size = size / num_threads;
-        
-        for (unsigned int t = 0; t < num_threads; ++t) {
-            init_threads.emplace_back([this, t, chunk_size, size]() {
-                std::random_device rd;
-                std::mt19937 gen(rd() + t);
-                std::uniform_int_distribution<int> dis(0, 255);
-                
-                size_t start = t * chunk_size;
-                size_t end = (t == num_threads - 1) ? size : (t + 1) * chunk_size;
-                
-                for (size_t i = start; i < end; ++i) {
-                    buffer1[i] = static_cast<uint8_t>(dis(gen));
-                }
-            });
-        }
-        
-        for (auto& thread : init_threads) {
-            thread.join();
-        }
-        
-        std::cout << "Memory initialized with " << num_threads << " threads." << std::endl;
+    if (parsed.empty()) {
+        return false;
     }
 
-    // Sequential read test with autovectorization (compiler-optimized)
-    void testSequentialRead() {
-        std::cout << "\n=== Sequential Read Test (Multi-threaded, Auto-vectorized) ===" << std::endl;
-        std::cout << "Buffer size: " << buffer1.size() / MB << " MB (" << buffer1.size() / GB << " GB)" << std::endl;
-        std::cout << "Threads: " << num_threads << std::endl;
-        std::cout << "Total data per iteration: " << (buffer1.size() * INNER_ITERATIONS) / MB << " MB" << std::endl;
-        
-        std::vector<double> bandwidths;
-        
-        for (size_t iter = 0; iter < ITERATIONS; ++iter) {
-            std::atomic<bool> start_flag{false};
-            std::vector<std::thread> threads;
-            std::vector<double> thread_bandwidths(num_threads);
-            
-            size_t chunk_size = buffer1.size() / num_threads;
-            
-            // Launch threads
-            for (unsigned int t = 0; t < num_threads; ++t) {
-                threads.emplace_back([this, t, chunk_size, &start_flag, &thread_bandwidths]() {
-                    // Try to set thread affinity (silently fail if not supported)
-                    setThreadAffinity(t);
-                    // Try to set high priority
-                    setHighPriority();
-                    
-                    size_t start = t * chunk_size;
-                    size_t end = (t == num_threads - 1) ? buffer1.size() : (t + 1) * chunk_size;
-                    size_t local_size = end - start;
-                    
-                    const uint64_t* data = reinterpret_cast<const uint64_t*>(buffer1.data() + start);
-                    size_t count = local_size / sizeof(uint64_t);
-                    
-                    // Warmup
-                    uint64_t warmup_sum = 0;
-                    for (size_t i = 0; i < count; ++i) {
-                        warmup_sum += data[i];
-                    }
-                    doNotOptimize(warmup_sum);
-                    
-                    // Wait for all threads to be ready
-                    while (!start_flag.load(std::memory_order_acquire)) {
-                        std::this_thread::yield();
-                    }
-                    
-                    memoryBarrier();
-                    auto start_time = now();
-                    
-                    // Multiple passes with simple reduction pattern for autovectorization
-                    for (size_t pass = 0; pass < INNER_ITERATIONS; ++pass) {
-                        uint64_t sum = 0;
-                        // Simple loop that compilers can easily autovectorize
-                        // Stride by cache line (8 uint64_t = 64 bytes) for better performance
-                        for (size_t i = 0; i < count; i += 8) {
-                            sum += data[i];
-                        }
-                        doNotOptimize(sum);
-                    }
-                    
-                    auto end_time = now();
-                    memoryBarrier();
-                    
-                    auto duration = std::chrono::duration_cast<Duration>(end_time - start_time);
-                    thread_bandwidths[t] = calculateBandwidth(local_size * INNER_ITERATIONS, duration);
-                });
-            }
-            
-            // Small delay to ensure all threads are ready
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            
-            // Start all threads simultaneously
-            start_flag.store(true, std::memory_order_release);
-            
-            // Wait for all threads
-            for (auto& thread : threads) {
-                thread.join();
-            }
-            
-            // Sum up bandwidth from all threads
-            double total_bandwidth = std::accumulate(thread_bandwidths.begin(), 
-                                                    thread_bandwidths.end(), 0.0);
-            bandwidths.push_back(total_bandwidth);
-        }
-        
-        printStatistics(bandwidths);
+    std::sort(parsed.begin(), parsed.end(), [](TestKind lhs, TestKind rhs) {
+        return static_cast<int>(lhs) < static_cast<int>(rhs);
+    });
+    parsed.erase(std::unique(parsed.begin(), parsed.end()), parsed.end());
+    *tests = parsed;
+    return true;
+}
+
+Statistics calculateStatistics(const std::vector<double>& values) {
+    if (values.empty()) {
+        return {};
     }
 
-    // Sequential write test with memset (optimized by compiler/library)
-    void testSequentialWrite() {
-        std::cout << "\n=== Sequential Write Test (Multi-threaded memset) ===" << std::endl;
-        std::cout << "Buffer size: " << buffer1.size() / MB << " MB (" << buffer1.size() / GB << " GB)" << std::endl;
-        std::cout << "Threads: " << num_threads << std::endl;
-        std::cout << "Total data per iteration: " << (buffer1.size() * INNER_ITERATIONS) / MB << " MB" << std::endl;
-        
-        std::vector<double> bandwidths;
-        
-        for (size_t iter = 0; iter < ITERATIONS; ++iter) {
-            std::atomic<bool> start_flag{false};
-            std::vector<std::thread> threads;
-            std::vector<double> thread_bandwidths(num_threads);
-            
-            size_t chunk_size = buffer1.size() / num_threads;
-            
-            for (unsigned int t = 0; t < num_threads; ++t) {
-                threads.emplace_back([this, t, chunk_size, &start_flag, &thread_bandwidths]() {
-                    setThreadAffinity(t);
-                    setHighPriority();
-                    
-                    size_t start = t * chunk_size;
-                    size_t end = (t == num_threads - 1) ? buffer1.size() : (t + 1) * chunk_size;
-                    size_t local_size = end - start;
-                    
-                    // Warmup
-                    std::memset(buffer1.data() + start, 0, local_size);
-                    
-                    while (!start_flag.load(std::memory_order_acquire)) {
-                        std::this_thread::yield();
-                    }
-                    
-                    memoryBarrier();
-                    auto start_time = now();
-                    
-                    for (size_t pass = 0; pass < INNER_ITERATIONS; ++pass) {
-                        std::memset(buffer1.data() + start, 0xAA, local_size);
-                    }
-                    
-                    auto end_time = now();
-                    memoryBarrier();
-                    
-                    auto duration = std::chrono::duration_cast<Duration>(end_time - start_time);
-                    thread_bandwidths[t] = calculateBandwidth(local_size * INNER_ITERATIONS, duration);
-                });
-            }
-            
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            start_flag.store(true, std::memory_order_release);
-            
-            for (auto& thread : threads) {
-                thread.join();
-            }
-            
-            double total_bandwidth = std::accumulate(thread_bandwidths.begin(), 
-                                                    thread_bandwidths.end(), 0.0);
-            bandwidths.push_back(total_bandwidth);
-        }
-        
-        printStatistics(bandwidths);
+    Statistics stats;
+    stats.average = std::accumulate(values.begin(), values.end(), 0.0) /
+                    static_cast<double>(values.size());
+
+    std::vector<double> sorted = values;
+    std::sort(sorted.begin(), sorted.end());
+    const std::size_t midpoint = sorted.size() / 2;
+    if (sorted.size() % 2 == 0) {
+        stats.median = (sorted[midpoint - 1] + sorted[midpoint]) / 2.0;
+    } else {
+        stats.median = sorted[midpoint];
     }
 
-    // Memory copy test (using memcpy) with multi-threading
-    void testMemoryCopy() {
-        std::cout << "\n=== Memory Copy Test (Multi-threaded memcpy) ===" << std::endl;
-        std::cout << "Buffer size: " << buffer1.size() / MB << " MB (" << buffer1.size() / GB << " GB)" << std::endl;
-        std::cout << "Threads: " << num_threads << std::endl;
-        std::cout << "Total data per iteration: " << (buffer1.size() * INNER_ITERATIONS) / MB << " MB" << std::endl;
-        
-        std::vector<double> bandwidths;
-        
-        for (size_t iter = 0; iter < ITERATIONS; ++iter) {
-            std::atomic<bool> start_flag{false};
-            std::vector<std::thread> threads;
-            std::vector<double> thread_bandwidths(num_threads);
-            
-            size_t chunk_size = buffer1.size() / num_threads;
-            
-            for (unsigned int t = 0; t < num_threads; ++t) {
-                threads.emplace_back([this, t, chunk_size, &start_flag, &thread_bandwidths]() {
-                    setThreadAffinity(t);
-                    setHighPriority();
-                    
-                    size_t start = t * chunk_size;
-                    size_t end = (t == num_threads - 1) ? buffer1.size() : (t + 1) * chunk_size;
-                    size_t local_size = end - start;
-                    
-                    // Warmup
-                    std::memcpy(buffer2.data() + start, buffer1.data() + start, local_size);
-                    
-                    while (!start_flag.load(std::memory_order_acquire)) {
-                        std::this_thread::yield();
-                    }
-                    
-                    memoryBarrier();
-                    auto start_time = now();
-                    
-                    for (size_t pass = 0; pass < INNER_ITERATIONS; ++pass) {
-                        std::memcpy(buffer2.data() + start, buffer1.data() + start, local_size);
-                    }
-                    
-                    auto end_time = now();
-                    memoryBarrier();
-                    
-                    auto duration = std::chrono::duration_cast<Duration>(end_time - start_time);
-                    // Calculate bandwidth based on actual data copied (not read+write)
-                    thread_bandwidths[t] = calculateBandwidth(local_size * INNER_ITERATIONS, duration);
-                });
-            }
-            
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            start_flag.store(true, std::memory_order_release);
-            
-            for (auto& thread : threads) {
-                thread.join();
-            }
-            
-            double total_bandwidth = std::accumulate(thread_bandwidths.begin(), 
-                                                    thread_bandwidths.end(), 0.0);
-            bandwidths.push_back(total_bandwidth);
-        }
-        
-        printStatistics(bandwidths);
-    }
+    stats.minimum = sorted.front();
+    stats.maximum = sorted.back();
 
-    // Print system information
-    static void printSystemInfo() {
-        std::cout << "=== System Information ===" << std::endl;
-        
+    double squared_sum = 0.0;
+    for (double value : values) {
+        const double delta = value - stats.average;
+        squared_sum += delta * delta;
+    }
+    stats.stdev = std::sqrt(squared_sum / static_cast<double>(values.size()));
+    return stats;
+}
+
+std::uint64_t splitMix64(std::uint64_t value) {
+    value += 0x9E3779B97F4A7C15ULL;
+    value = (value ^ (value >> 30U)) * 0xBF58476D1CE4E5B9ULL;
+    value = (value ^ (value >> 27U)) * 0x94D049BB133111EBULL;
+    return value ^ (value >> 31U);
+}
+
+PlatformInfo detectPlatformInfo() {
+    PlatformInfo info;
 #ifdef _WIN32
-        std::cout << "Operating System: Windows" << std::endl;
-        
-        SYSTEM_INFO sysInfo;
-        GetSystemInfo(&sysInfo);
-        std::cout << "Page size: " << sysInfo.dwPageSize << " bytes" << std::endl;
-        std::cout << "Number of processors: " << sysInfo.dwNumberOfProcessors << std::endl;
-        
-        MEMORYSTATUSEX memInfo;
-        memInfo.dwLength = sizeof(MEMORYSTATUSEX);
-        GlobalMemoryStatusEx(&memInfo);
-        std::cout << "Total physical memory: " << memInfo.ullTotalPhys / (1024 * 1024) << " MB" << std::endl;
-#elif __APPLE__
-        std::cout << "Operating System: macOS" << std::endl;
-        std::cout << "Page size: " << getpagesize() << " bytes" << std::endl;
-#elif __linux__
-        std::cout << "Operating System: Linux" << std::endl;
-        std::cout << "Page size: " << getpagesize() << " bytes" << std::endl;
-        
-        // Try to read memory info
-        std::cout << "CPU cores: " << sysconf(_SC_NPROCESSORS_ONLN) << std::endl;
+    SYSTEM_INFO system_info;
+    GetSystemInfo(&system_info);
+    info.page_size = system_info.dwPageSize;
+    info.hardware_threads = system_info.dwNumberOfProcessors > 0
+                                ? system_info.dwNumberOfProcessors
+                                : 1;
+
+    MEMORYSTATUSEX memory_status{};
+    memory_status.dwLength = sizeof(memory_status);
+    if (GlobalMemoryStatusEx(&memory_status)) {
+        info.physical_memory_bytes = memory_status.ullTotalPhys;
+    }
 #else
-        std::cout << "Operating System: Unknown" << std::endl;
+    const long page_size = sysconf(_SC_PAGESIZE);
+    info.page_size = page_size > 0 ? static_cast<std::size_t>(page_size) : 4096;
+
+    const unsigned int hw_threads = std::thread::hardware_concurrency();
+    info.hardware_threads = hw_threads > 0 ? hw_threads : 1;
+
+#if defined(__APPLE__)
+    std::uint64_t memsize = 0;
+    std::size_t memsize_len = sizeof(memsize);
+    if (sysctlbyname("hw.memsize", &memsize, &memsize_len, nullptr, 0) == 0) {
+        info.physical_memory_bytes = memsize;
+    }
+
+    unsigned int perf_cores = 0;
+    std::size_t perf_cores_len = sizeof(perf_cores);
+    if (sysctlbyname("hw.perflevel0.physicalcpu", &perf_cores, &perf_cores_len,
+                     nullptr, 0) == 0) {
+        info.performance_cores = perf_cores;
+    }
+#if defined(__aarch64__) || defined(__arm64__)
+    info.apple_silicon = true;
 #endif
-        
-        std::cout << std::endl;
+#else
+    const long phys_pages = sysconf(_SC_PHYS_PAGES);
+    if (phys_pages > 0 && page_size > 0) {
+        info.physical_memory_bytes =
+            static_cast<std::uint64_t>(phys_pages) * static_cast<std::uint64_t>(page_size);
+    }
+#endif
+#endif
+
+    if (info.physical_memory_bytes == 0) {
+        info.physical_memory_bytes = 8ULL * GB;
+    }
+    return info;
+}
+
+std::size_t chooseDefaultBufferSize(const PlatformInfo& platform) {
+    const std::uint64_t one_eighth_memory = platform.physical_memory_bytes / 8ULL;
+    std::uint64_t chosen = std::min<std::uint64_t>(kMaxDefaultBufferSize, one_eighth_memory);
+    chosen = std::max<std::uint64_t>(chosen, kMinDefaultBufferSize);
+    return static_cast<std::size_t>(std::min<std::uint64_t>(chosen, kMaxBufferSize));
+}
+
+unsigned int chooseDefaultThreadCount(const PlatformInfo& platform, ThreadPolicy policy) {
+    if (platform.apple_silicon && policy == ThreadPolicy::Perf) {
+        if (platform.performance_cores > 0) {
+            return platform.performance_cores;
+        }
+        return std::min(platform.hardware_threads, 4U);
+    }
+    return std::max(1U, platform.hardware_threads);
+}
+
+void printUsage(const char* program_name, const PlatformInfo& platform) {
+    const std::size_t default_size_mb = chooseDefaultBufferSize(platform) / MB;
+    std::cout << "Usage: " << program_name << " [size_mb] [options]\n\n"
+              << "Options:\n"
+              << "  --size-mb <n>         Buffer size in MiB (default: " << default_size_mb
+              << ")\n"
+              << "  --threads <n>         Override worker thread count\n"
+              << "  --tests <list>        Comma-separated tests: read,write,copy\n"
+              << "  --iterations <n>      Measured iterations per test (default: "
+              << kDefaultMeasuredIterations << ")\n"
+              << "  --warmup <n>          Warmup iterations per test (default: "
+              << kDefaultWarmupIterations << ")\n"
+              << "  --thread-policy <p>   perf or all\n"
+              << "  --no-qos              Disable macOS QoS hinting\n"
+              << "  --help                Show this message\n\n"
+              << "Examples:\n"
+              << "  " << program_name << " 1024\n"
+              << "  " << program_name << " --size-mb 1024 --tests read,copy\n"
+              << "  " << program_name
+              << " --threads 4 --warmup 2 --iterations 7 --thread-policy perf\n";
+}
+
+void printSystemInfo(const PlatformInfo& platform) {
+    std::cout << "=== System Information ===\n";
+#ifdef _WIN32
+    std::cout << "Operating System: Windows\n";
+#elif defined(__APPLE__)
+    std::cout << "Operating System: macOS\n";
+#elif defined(__linux__)
+    std::cout << "Operating System: Linux\n";
+#else
+    std::cout << "Operating System: Unknown\n";
+#endif
+    std::cout << "Page size: " << platform.page_size << " bytes\n";
+    std::cout << "Physical memory: " << formatBytes(platform.physical_memory_bytes) << '\n';
+    std::cout << "Hardware threads: " << platform.hardware_threads << '\n';
+    if (platform.apple_silicon) {
+        if (platform.performance_cores > 0) {
+            std::cout << "Performance cores: " << platform.performance_cores << '\n';
+        } else {
+            std::cout << "Performance cores: unavailable (falling back to conservative default)\n";
+        }
+    }
+    std::cout << '\n';
+}
+
+class AlignedBuffer {
+public:
+    AlignedBuffer() = default;
+
+    AlignedBuffer(std::size_t size, std::size_t alignment)
+        : size_(size), alignment_(alignment) {
+        if (size_ == 0) {
+            throw std::runtime_error("buffer size must be greater than zero");
+        }
+
+#ifdef _WIN32
+        data_ = static_cast<std::uint8_t*>(_aligned_malloc(size_, alignment_));
+        if (data_ == nullptr) {
+            throw std::bad_alloc();
+        }
+#else
+        void* raw = nullptr;
+        if (posix_memalign(&raw, alignment_, size_) != 0 || raw == nullptr) {
+            throw std::bad_alloc();
+        }
+        data_ = static_cast<std::uint8_t*>(raw);
+#endif
+    }
+
+    AlignedBuffer(const AlignedBuffer&) = delete;
+    AlignedBuffer& operator=(const AlignedBuffer&) = delete;
+
+    AlignedBuffer(AlignedBuffer&& other) noexcept
+        : data_(other.data_), size_(other.size_), alignment_(other.alignment_) {
+        other.data_ = nullptr;
+        other.size_ = 0;
+        other.alignment_ = 0;
+    }
+
+    AlignedBuffer& operator=(AlignedBuffer&& other) noexcept {
+        if (this == &other) {
+            return *this;
+        }
+        reset();
+        data_ = other.data_;
+        size_ = other.size_;
+        alignment_ = other.alignment_;
+        other.data_ = nullptr;
+        other.size_ = 0;
+        other.alignment_ = 0;
+        return *this;
+    }
+
+    ~AlignedBuffer() {
+        reset();
+    }
+
+    std::uint8_t* data() { return data_; }
+    const std::uint8_t* data() const { return data_; }
+    std::size_t size() const { return size_; }
+    std::size_t alignment() const { return alignment_; }
+
+private:
+    void reset() {
+        if (data_ == nullptr) {
+            return;
+        }
+#ifdef _WIN32
+        _aligned_free(data_);
+#else
+        free(data_);
+#endif
+        data_ = nullptr;
+        size_ = 0;
+        alignment_ = 0;
+    }
+
+    std::uint8_t* data_ = nullptr;
+    std::size_t size_ = 0;
+    std::size_t alignment_ = 0;
+};
+
+}  // namespace
+
+class MemoryBenchmark {
+public:
+    MemoryBenchmark(const PlatformInfo& platform, const BenchmarkOptions& options)
+        : platform_(platform),
+          options_(options),
+          alignment_(std::max(platform.page_size, kCacheLineSize)),
+          thread_count_(resolveThreadCount()),
+          buffer_a_(options.size_bytes, alignment_),
+          buffer_b_(options.size_bytes, alignment_) {
+        initializeBuffers();
+        buildSlices();
+        startWorkers();
+    }
+
+    ~MemoryBenchmark() {
+        stopWorkers();
+    }
+
+    void printConfiguration() const {
+        std::cout << "=== Benchmark Configuration ===\n";
+        std::cout << "Size: " << options_.size_bytes / MB << " MiB\n";
+        std::cout << "Alignment: " << alignment_ << " bytes\n";
+        std::cout << "Threads: " << thread_count_ << '\n';
+        std::cout << "Warmup iterations: " << options_.warmup_iterations << '\n';
+        std::cout << "Measured iterations: " << options_.measured_iterations << '\n';
+        std::cout << "Thread policy: " << threadPolicyToString(options_.thread_policy) << '\n';
+        std::cout << "macOS QoS hint: " << (options_.use_qos ? "enabled" : "disabled") << '\n';
+        std::cout << "Tests: ";
+        for (std::size_t i = 0; i < options_.tests.size(); ++i) {
+            if (i > 0) {
+                std::cout << ',';
+            }
+            std::cout << testKindToCliName(options_.tests[i]);
+        }
+        std::cout << "\n\n";
+    }
+
+    void run() {
+        for (TestKind kind : options_.tests) {
+            runBandwidthTest(kind);
+        }
     }
 
 private:
-    void printStatistics(const std::vector<double>& bandwidths) {
-        double avg = calculateAverage(bandwidths);
-        double min = *std::min_element(bandwidths.begin(), bandwidths.end());
-        double max = *std::max_element(bandwidths.begin(), bandwidths.end());
-        
-        std::cout << std::fixed << std::setprecision(2);
-        std::cout << "Avg bandwidth: " << (avg / 1024.0) << " GB/s (" << avg << " MB/s)" << std::endl;
-        std::cout << "Min bandwidth: " << (min / 1024.0) << " GB/s (" << min << " MB/s)" << std::endl;
-        std::cout << "Max bandwidth: " << (max / 1024.0) << " GB/s (" << max << " MB/s)" << std::endl;
+    struct Slice {
+        std::size_t offset = 0;
+        std::size_t size = 0;
+    };
+
+    struct WorkerCommand {
+        TestKind kind = TestKind::Read;
+        std::size_t passes = 1;
+        std::uint8_t write_pattern = 0xAA;
+    };
+
+    struct TimerResult {
+        std::uint64_t elapsed_ns = 0;
+    };
+
+    template <typename T>
+    static inline void doNotOptimize(const T& value) {
+#if defined(__clang__) || defined(__GNUC__)
+        asm volatile("" : : "r,m"(value) : "memory");
+#elif defined(_WIN32)
+        _ReadWriteBarrier();
+        volatile T sink = value;
+        _ReadWriteBarrier();
+        (void)sink;
+#else
+        (void)value;
+#endif
     }
 
-    double calculateAverage(const std::vector<double>& values) {
-        double sum = 0.0;
-        for (auto v : values) {
-            sum += v;
-        }
-        return sum / values.size();
+    static std::uint64_t monotonicNowNs() {
+#ifdef __APPLE__
+        return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+#else
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+#endif
     }
+
+    unsigned int resolveThreadCount() const {
+        unsigned int requested = options_.threads_override > 0
+                                     ? options_.threads_override
+                                     : chooseDefaultThreadCount(platform_, options_.thread_policy);
+        const std::size_t max_threads_by_size =
+            std::max<std::size_t>(1, options_.size_bytes / kCacheLineSize);
+        requested = static_cast<unsigned int>(
+            std::min<std::size_t>(requested, max_threads_by_size));
+        return std::max(1U, requested);
+    }
+
+    void initializeBuffers() {
+        std::cout << "Allocating " << options_.size_bytes / MB << " MiB per buffer..." << std::endl;
+        auto* words_a = reinterpret_cast<std::uint64_t*>(buffer_a_.data());
+        auto* words_b = reinterpret_cast<std::uint64_t*>(buffer_b_.data());
+        const std::size_t word_count = options_.size_bytes / sizeof(std::uint64_t);
+
+        for (std::size_t i = 0; i < word_count; ++i) {
+            words_a[i] = splitMix64(0x123456789ABCDEF0ULL + static_cast<std::uint64_t>(i));
+            words_b[i] = splitMix64(0x0FEDCBA987654321ULL + static_cast<std::uint64_t>(i));
+        }
+
+        const std::size_t tail_offset = word_count * sizeof(std::uint64_t);
+        for (std::size_t i = tail_offset; i < options_.size_bytes; ++i) {
+            buffer_a_.data()[i] = static_cast<std::uint8_t>(i & 0xFFU);
+            buffer_b_.data()[i] = static_cast<std::uint8_t>((255U - i) & 0xFFU);
+        }
+
+        doNotOptimize(words_a[0]);
+        doNotOptimize(words_b[0]);
+        std::cout << "Buffers initialized with deterministic non-zero data.\n\n";
+    }
+
+    void buildSlices() {
+        slices_.clear();
+        slices_.reserve(thread_count_);
+
+        const std::size_t aligned_chunk =
+            alignDown(options_.size_bytes / thread_count_, kCacheLineSize);
+        std::size_t offset = 0;
+        for (unsigned int index = 0; index < thread_count_; ++index) {
+            Slice slice;
+            slice.offset = offset;
+            if (index == thread_count_ - 1) {
+                slice.size = options_.size_bytes - offset;
+            } else {
+                slice.size = aligned_chunk;
+            }
+            slices_.push_back(slice);
+            offset += slice.size;
+        }
+    }
+
+    void startWorkers() {
+        workers_.reserve(thread_count_);
+        for (unsigned int index = 0; index < thread_count_; ++index) {
+            workers_.emplace_back([this, index]() { workerLoop(index, slices_[index]); });
+        }
+    }
+
+    void stopWorkers() {
+        {
+            std::lock_guard<std::mutex> lock(worker_mutex_);
+            stop_workers_ = true;
+            ++command_generation_;
+            ++release_generation_;
+        }
+        worker_command_cv_.notify_all();
+        worker_release_cv_.notify_all();
+
+        for (auto& worker : workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+        workers_.clear();
+    }
+
+    static std::size_t alignDown(std::size_t value, std::size_t alignment) {
+        return value - (value % alignment);
+    }
+
+    void maybeApplyThreadPolicy() const {
+#ifdef __APPLE__
+        if (options_.use_qos && options_.thread_policy == ThreadPolicy::Perf) {
+            pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+        }
+#else
+        (void)options_;
+#endif
+    }
+
+    void workerLoop(unsigned int index, const Slice& slice) {
+        maybeApplyThreadPolicy();
+
+        std::size_t observed_command_generation = 0;
+        std::size_t observed_release_generation = 0;
+
+        while (true) {
+            WorkerCommand command;
+            {
+                std::unique_lock<std::mutex> lock(worker_mutex_);
+                worker_command_cv_.wait(lock, [this, &observed_command_generation]() {
+                    return stop_workers_ || command_generation_ != observed_command_generation;
+                });
+                if (stop_workers_) {
+                    return;
+                }
+
+                observed_command_generation = command_generation_;
+                command = current_command_;
+                ++ready_workers_;
+                if (ready_workers_ == thread_count_) {
+                    worker_ready_cv_.notify_one();
+                }
+
+                worker_release_cv_.wait(lock, [this, &observed_release_generation]() {
+                    return stop_workers_ || release_generation_ != observed_release_generation;
+                });
+                if (stop_workers_) {
+                    return;
+                }
+                observed_release_generation = release_generation_;
+            }
+
+            executeCommand(command, slice, index);
+
+            {
+                std::lock_guard<std::mutex> lock(worker_mutex_);
+                ++completed_workers_;
+                if (completed_workers_ == thread_count_) {
+                    worker_done_cv_.notify_one();
+                }
+            }
+        }
+    }
+
+    void executeCommand(const WorkerCommand& command, const Slice& slice, unsigned int index) {
+        switch (command.kind) {
+            case TestKind::Read:
+                runReadPasses(slice, command.passes, index);
+                break;
+            case TestKind::Write:
+                runWritePasses(slice, command.passes, command.write_pattern);
+                break;
+            case TestKind::Copy:
+                runCopyPasses(slice, command.passes);
+                break;
+        }
+    }
+
+    void runReadPasses(const Slice& slice, std::size_t passes, unsigned int worker_index) {
+        const auto* bytes = buffer_a_.data() + slice.offset;
+        const auto* words = reinterpret_cast<const std::uint64_t*>(bytes);
+        const std::size_t word_count = slice.size / sizeof(std::uint64_t);
+
+        std::uint64_t accumulator0 = splitMix64(worker_index + 1U);
+        std::uint64_t accumulator1 = splitMix64(worker_index + 11U);
+        std::uint64_t accumulator2 = splitMix64(worker_index + 21U);
+        std::uint64_t accumulator3 = splitMix64(worker_index + 31U);
+
+        for (std::size_t pass = 0; pass < passes; ++pass) {
+            std::size_t i = 0;
+            for (; i + 4 <= word_count; i += 4) {
+                accumulator0 += words[i];
+                accumulator1 += words[i + 1];
+                accumulator2 += words[i + 2];
+                accumulator3 += words[i + 3];
+            }
+            for (; i < word_count; ++i) {
+                accumulator0 += words[i];
+            }
+        }
+
+        const std::size_t tail_offset = word_count * sizeof(std::uint64_t);
+        std::uint64_t tail = 0;
+        for (std::size_t i = tail_offset; i < slice.size; ++i) {
+            tail += bytes[i];
+        }
+
+        const std::uint64_t local_sink =
+            accumulator0 ^ accumulator1 ^ accumulator2 ^ accumulator3 ^ tail;
+        sink_.fetch_xor(local_sink, std::memory_order_relaxed);
+        doNotOptimize(local_sink);
+    }
+
+    void runWritePasses(const Slice& slice, std::size_t passes, std::uint8_t base_pattern) {
+        auto* bytes = buffer_a_.data() + slice.offset;
+        std::uint8_t pattern = base_pattern;
+
+        for (std::size_t pass = 0; pass < passes; ++pass) {
+            std::memset(bytes, pattern, slice.size);
+            pattern = (pattern == 0x55U) ? 0xAAU : 0x55U;
+        }
+
+        const std::uint64_t local_sink =
+            static_cast<std::uint64_t>(bytes[0]) ^
+            static_cast<std::uint64_t>(bytes[slice.size - 1]) << 8U;
+        sink_.fetch_xor(local_sink, std::memory_order_relaxed);
+        doNotOptimize(local_sink);
+    }
+
+    void runCopyPasses(const Slice& slice, std::size_t passes) {
+        auto* a = buffer_a_.data() + slice.offset;
+        auto* b = buffer_b_.data() + slice.offset;
+
+        for (std::size_t pass = 0; pass < passes; ++pass) {
+            if ((pass % 2U) == 0U) {
+                std::memcpy(b, a, slice.size);
+            } else {
+                std::memcpy(a, b, slice.size);
+            }
+        }
+
+        const std::uint64_t local_sink =
+            static_cast<std::uint64_t>(a[0]) ^
+            (static_cast<std::uint64_t>(b[slice.size - 1]) << 8U);
+        sink_.fetch_xor(local_sink, std::memory_order_relaxed);
+        doNotOptimize(local_sink);
+    }
+
+    TimerResult runTimedCommand(const WorkerCommand& command) {
+        {
+            std::unique_lock<std::mutex> lock(worker_mutex_);
+            current_command_ = command;
+            ready_workers_ = 0;
+            completed_workers_ = 0;
+            ++command_generation_;
+            worker_command_cv_.notify_all();
+
+            worker_ready_cv_.wait(lock, [this]() { return ready_workers_ == thread_count_; });
+            const std::uint64_t start_ns = monotonicNowNs();
+            ++release_generation_;
+            worker_release_cv_.notify_all();
+            lock.unlock();
+
+            std::unique_lock<std::mutex> done_lock(worker_mutex_);
+            worker_done_cv_.wait(done_lock,
+                                 [this]() { return completed_workers_ == thread_count_; });
+            const std::uint64_t end_ns = monotonicNowNs();
+            return {end_ns - start_ns};
+        }
+    }
+
+    void printTestResult(TestKind kind, const TestResult& result) const {
+        const auto& bw = result.bandwidth_mb_per_sec;
+        const auto& elapsed = result.elapsed_ms;
+
+        std::cout << "=== " << testKindToTitle(kind) << " Test ===\n";
+        std::cout << "size_mb: " << options_.size_bytes / MB << '\n';
+        std::cout << "threads: " << thread_count_ << '\n';
+        std::cout << "warmup: " << options_.warmup_iterations << '\n';
+        std::cout << "iterations: " << options_.measured_iterations << '\n';
+        std::cout << "logical_bytes_per_iteration: " << options_.size_bytes << " ("
+                  << formatBytes(options_.size_bytes) << ")\n";
+        std::cout << "measured_elapsed_ms: avg " << std::fixed << std::setprecision(3)
+                  << elapsed.average << ", median " << elapsed.median << '\n';
+        std::cout << std::setprecision(2);
+        std::cout << "avg bandwidth: " << (bw.average / 1024.0) << " GB/s (" << bw.average
+                  << " MB/s)\n";
+        std::cout << "median bandwidth: " << (bw.median / 1024.0) << " GB/s (" << bw.median
+                  << " MB/s)\n";
+        std::cout << "min bandwidth: " << (bw.minimum / 1024.0) << " GB/s (" << bw.minimum
+                  << " MB/s)\n";
+        std::cout << "max bandwidth: " << (bw.maximum / 1024.0) << " GB/s (" << bw.maximum
+                  << " MB/s)\n";
+        std::cout << "stdev bandwidth: " << (bw.stdev / 1024.0) << " GB/s (" << bw.stdev
+                  << " MB/s)\n";
+        if (kind == TestKind::Copy) {
+            std::cout << "Copy throughput reports logical copied bytes, not doubled DRAM traffic.\n";
+        }
+        std::cout << '\n';
+    }
+
+    void runBandwidthTest(TestKind kind) {
+        std::vector<double> bandwidth_samples;
+        std::vector<double> elapsed_samples;
+
+        std::uint8_t write_pattern = 0x55U;
+        for (std::size_t warmup_index = 0; warmup_index < options_.warmup_iterations;
+             ++warmup_index) {
+            WorkerCommand command;
+            command.kind = kind;
+            command.passes = 1;
+            command.write_pattern = write_pattern;
+            (void)runTimedCommand(command);
+            if (kind == TestKind::Write) {
+                write_pattern = (write_pattern == 0x55U) ? 0xAAU : 0x55U;
+            }
+        }
+
+        for (std::size_t iteration = 0; iteration < options_.measured_iterations; ++iteration) {
+            WorkerCommand command;
+            command.kind = kind;
+            command.passes = 1;
+            command.write_pattern = write_pattern;
+
+            const TimerResult timer = runTimedCommand(command);
+            const double seconds = static_cast<double>(timer.elapsed_ns) / 1'000'000'000.0;
+            const double bandwidth_mb_per_sec =
+                (options_.size_bytes / static_cast<double>(MB)) / seconds;
+            bandwidth_samples.push_back(bandwidth_mb_per_sec);
+            elapsed_samples.push_back(static_cast<double>(timer.elapsed_ns) / 1'000'000.0);
+
+            if (kind == TestKind::Write) {
+                write_pattern = (write_pattern == 0x55U) ? 0xAAU : 0x55U;
+            }
+        }
+
+        TestResult result;
+        result.bandwidth_samples_mb_per_sec = bandwidth_samples;
+        result.elapsed_samples_ms = elapsed_samples;
+        result.bandwidth_mb_per_sec = calculateStatistics(bandwidth_samples);
+        result.elapsed_ms = calculateStatistics(elapsed_samples);
+        printTestResult(kind, result);
+    }
+
+    PlatformInfo platform_;
+    BenchmarkOptions options_;
+    std::size_t alignment_ = 0;
+    unsigned int thread_count_ = 1;
+    AlignedBuffer buffer_a_;
+    AlignedBuffer buffer_b_;
+    std::vector<Slice> slices_;
+    std::vector<std::thread> workers_;
+
+    std::atomic<std::uint64_t> sink_{0};
+
+    std::mutex worker_mutex_;
+    std::condition_variable worker_command_cv_;
+    std::condition_variable worker_ready_cv_;
+    std::condition_variable worker_release_cv_;
+    std::condition_variable worker_done_cv_;
+    WorkerCommand current_command_;
+    std::size_t command_generation_ = 0;
+    std::size_t release_generation_ = 0;
+    std::size_t ready_workers_ = 0;
+    std::size_t completed_workers_ = 0;
+    bool stop_workers_ = false;
 };
 
 int main(int argc, char* argv[]) {
-    std::cout << "╔══════════════════════════════════════╗" << std::endl;
-    std::cout << "║   Memory Benchmark Tool v" << MEMBENCH_VERSION << "       ║" << std::endl;
-    std::cout << "║   Multi-threaded Memory Testing      ║" << std::endl;
-    std::cout << "║   With SIMD & Loop Optimizations     ║" << std::endl;
-    std::cout << "╚══════════════════════════════════════╝" << std::endl;
-    std::cout << std::endl;
+    const PlatformInfo platform = detectPlatformInfo();
 
-    MemoryBenchmark::printSystemInfo();
+    BenchmarkOptions options;
+    options.size_bytes = chooseDefaultBufferSize(platform);
+    options.warmup_iterations = kDefaultWarmupIterations;
+    options.measured_iterations = kDefaultMeasuredIterations;
+    options.thread_policy = platform.apple_silicon ? ThreadPolicy::Perf : ThreadPolicy::All;
+    options.use_qos = platform.apple_silicon;
+    options.tests = {TestKind::Read, TestKind::Write, TestKind::Copy};
 
-    // Parse command line arguments for buffer size
-    size_t bufferSize = 2ULL * 1024 * 1024 * 1024; // Default 2GB
-    if (argc > 1) {
-        try {
-            std::stringstream ss(argv[1]);
-            unsigned long long sizeMB = 0;
-            ss >> sizeMB;
-            if (!ss.fail() && sizeMB > 0 && sizeMB <= 16384) { // Max 16GB
-                bufferSize = sizeMB * 1024 * 1024;
-                std::cout << "Using custom buffer size: " << bufferSize / (1024 * 1024) << " MB" << std::endl;
-            } else {
-                std::cerr << "Invalid buffer size (must be 1-16384 MB), using default 2048MB" << std::endl;
+    bool positional_size_consumed = false;
+    for (int index = 1; index < argc; ++index) {
+        const std::string arg = argv[index];
+        auto requireValue = [&](const std::string& option_name) -> std::string {
+            if (index + 1 >= argc) {
+                throw std::runtime_error("missing value for " + option_name);
             }
-        } catch (...) {
-            std::cerr << "Invalid buffer size argument, using default 2048MB" << std::endl;
+            ++index;
+            return argv[index];
+        };
+
+        if (arg == "--help") {
+            printUsage(argv[0], platform);
+            return 0;
         }
+        if (arg == "--size-mb") {
+            std::uint64_t size_mb = 0;
+            if (!parseUnsigned64(requireValue(arg), &size_mb) || size_mb == 0 ||
+                size_mb > (kMaxBufferSize / MB)) {
+                throw std::runtime_error("invalid --size-mb value");
+            }
+            options.size_bytes = static_cast<std::size_t>(size_mb) * MB;
+            continue;
+        }
+        if (arg == "--threads") {
+            std::uint64_t threads = 0;
+            if (!parseUnsigned64(requireValue(arg), &threads) || threads == 0 ||
+                threads > std::numeric_limits<unsigned int>::max()) {
+                throw std::runtime_error("invalid --threads value");
+            }
+            options.threads_override = static_cast<unsigned int>(threads);
+            continue;
+        }
+        if (arg == "--iterations") {
+            std::uint64_t iterations = 0;
+            if (!parseUnsigned64(requireValue(arg), &iterations) || iterations == 0) {
+                throw std::runtime_error("invalid --iterations value");
+            }
+            options.measured_iterations = static_cast<std::size_t>(iterations);
+            continue;
+        }
+        if (arg == "--warmup") {
+            std::uint64_t warmup = 0;
+            if (!parseUnsigned64(requireValue(arg), &warmup)) {
+                throw std::runtime_error("invalid --warmup value");
+            }
+            options.warmup_iterations = static_cast<std::size_t>(warmup);
+            continue;
+        }
+        if (arg == "--tests") {
+            if (!parseTestList(requireValue(arg), &options.tests)) {
+                throw std::runtime_error("invalid --tests list");
+            }
+            continue;
+        }
+        if (arg == "--thread-policy") {
+            if (!parseThreadPolicy(requireValue(arg), &options.thread_policy)) {
+                throw std::runtime_error("invalid --thread-policy value");
+            }
+            continue;
+        }
+        if (arg == "--no-qos") {
+            options.use_qos = false;
+            continue;
+        }
+        if (!arg.empty() && arg.front() == '-') {
+            throw std::runtime_error("unknown option: " + arg);
+        }
+        if (positional_size_consumed) {
+            throw std::runtime_error("unexpected positional argument: " + arg);
+        }
+
+        std::uint64_t size_mb = 0;
+        if (!parseUnsigned64(arg, &size_mb) || size_mb == 0 || size_mb > (kMaxBufferSize / MB)) {
+            throw std::runtime_error("invalid buffer size argument");
+        }
+        options.size_bytes = static_cast<std::size_t>(size_mb) * MB;
+        positional_size_consumed = true;
     }
-    
-    std::cout << "\nNote: This benchmark uses multi-threading and high priority scheduling." << std::endl;
-    std::cout << "For best results:" << std::endl;
-    std::cout << "  - Close other applications to minimize interference" << std::endl;
-    std::cout << "  - On Linux, run with sudo for better thread scheduling" << std::endl;
-    std::cout << std::endl;
 
-    MemoryBenchmark benchmark(bufferSize);
+    std::cout << "========================================\n";
+    std::cout << "MemBench v" << MEMBENCH_VERSION << '\n';
+    std::cout << "Reliable Memory Read/Write/Copy Benchmark\n";
+    std::cout << "========================================\n\n";
 
-    // Bandwidth tests (with multi-threading)
-    benchmark.testSequentialRead();
-    benchmark.testSequentialWrite();
-    benchmark.testMemoryCopy();
-    
-    // std::cout << "\n╔═══════════════════════════════════════════════════╗" << std::endl;
-    // std::cout << "║          BENCHMARK COMPLETE                       ║" << std::endl;
-    // std::cout << "╚═══════════════════════════════════════════════════╝" << std::endl;
+    printSystemInfo(platform);
+
+    try {
+        MemoryBenchmark benchmark(platform, options);
+        benchmark.printConfiguration();
+        benchmark.run();
+    } catch (const std::exception& ex) {
+        std::cerr << "Error: " << ex.what() << '\n';
+        return 1;
+    }
 
     return 0;
 }
