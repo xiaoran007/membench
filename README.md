@@ -1,22 +1,27 @@
 # MemBench
 
-MemBench is a cross-platform memory bandwidth benchmark focused on reliable `read`, `write`, and `copy` measurements. The current implementation is tuned first for macOS, especially Apple Silicon, while keeping portable fallbacks for Linux and Windows.
+MemBench is a cross-platform memory bandwidth benchmark for `read`, `write`, and `copy`. It now has two behaviors:
+
+- `standard`: stable, conservative measurements
+- `peak`: Apple Silicon-first peak seeking with short auto-calibration
+
+On Apple Silicon, `./membench` now defaults to `peak` mode and tries to pick the best thread count and kernel per test.
 
 ## What It Measures
 
 - Sequential read bandwidth
 - Sequential write bandwidth
-- Memory copy throughput (`memcpy`)
+- Memory copy throughput
 
-The benchmark now uses:
+The benchmark uses:
 
 - Page-aligned buffers
 - One global timer per measured iteration
-- Reusable worker threads instead of recreating threads every round
+- Reusable worker threads inside each runner
 - Separate warmup and measured phases
 - Median and standard deviation in addition to average/min/max
-
-On Apple Silicon, the default policy favors performance cores and uses QoS hints by default to reduce scheduler noise.
+- Apple Silicon NEON peak kernels for selected paths
+- Per-test calibration in peak mode
 
 ## Build Requirements
 
@@ -37,11 +42,9 @@ On Apple Silicon, the default policy favors performance cores and uses QoS hints
 Or manually:
 
 ```bash
-mkdir -p build
-cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-cmake --build .
-./membench
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+./build/membench
 ```
 
 ### Windows
@@ -53,11 +56,9 @@ build.bat
 Or manually:
 
 ```cmd
-mkdir build
-cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-cmake --build . --config Release
-Release\membench.exe
+cmake -S . -B build
+cmake --build build --config Release
+.\build\Release\membench.exe
 ```
 
 ## Usage
@@ -65,21 +66,17 @@ Release\membench.exe
 Basic usage:
 
 ```bash
-./membench
+./build/membench
+./build/membench 1024
 ```
 
-Compatible positional size argument:
+Useful examples:
 
 ```bash
-./membench 1024
-```
-
-Explicit options:
-
-```bash
-./membench --size-mb 1024 --tests read,copy
-./membench --threads 4 --warmup 2 --iterations 7
-./membench --size-mb 1024 --thread-policy perf
+./build/membench --mode standard
+./build/membench --mode peak --size-mb 1024 --tests read,copy
+./build/membench --mode peak --no-calibrate
+./build/membench --threads 4 --warmup 2 --iterations 7
 ```
 
 ### CLI Options
@@ -89,8 +86,10 @@ Explicit options:
 - `--tests read,write,copy`: choose a comma-separated subset
 - `--iterations <n>`: measured iterations per test
 - `--warmup <n>`: warmup iterations per test
-- `--thread-policy perf|all`: use performance-core-biased or all-thread defaults
-- `--no-qos`: disable macOS QoS hinting
+- `--thread-policy perf|all`: constrain thread selection
+- `--mode standard|peak`: choose stable or peak-seeking behavior
+- `--no-calibrate`: disable peak-mode calibration
+- `--no-qos`: disable macOS QoS hints
 - `--help`: print usage
 
 ## Defaults
@@ -98,35 +97,50 @@ Explicit options:
 - Default buffer size: `min(1 GiB, physical_memory / 8)`, with a floor of `256 MiB`
 - Default measured iterations: `7`
 - Default warmup iterations: `2`
-- Default Apple Silicon thread policy: `perf`
-- Default non-Apple thread policy: `all`
+- Default Apple Silicon mode: `peak`
+- Default Apple Silicon thread policy: `all`
+- Default non-Apple mode: `standard`
+
+On Apple Silicon, peak mode calibrates each test independently and may choose different kernels and thread counts for `read`, `write`, and `copy`.
 
 ## Interpreting Results
 
 Each test prints:
 
+- `mode`
+- `kernel`
+- `selected_threads`
+- `calibrated`
 - `size_mb`
-- `threads`
 - `warmup`
 - `iterations`
 - `logical_bytes_per_iteration`
 - `measured_elapsed_ms`
 - `avg / median / min / max / stdev bandwidth`
 
-For `copy`, the reported bandwidth is logical copied bytes per second. It is not doubled to estimate total DRAM bus traffic.
+For `copy`, MemBench prints two bandwidth views:
+
+- `logical ... bandwidth`: logical memcpy throughput
+- `estimated traffic ... bandwidth`: logical throughput multiplied by 2
+
+The estimated traffic number is only a convenience for comparing with vendor memory-bandwidth figures. It is not a hardware counter measurement.
 
 ## Notes On Accuracy
 
 - Larger buffers better reflect main-memory behavior; small buffers can be influenced by cache.
 - Background activity, thermal throttling, and memory pressure can still affect results.
-- On Apple Silicon, `perf` mode usually gives more stable numbers than using all cores.
+- `standard` mode is better when you want stable, repeatable comparisons.
+- `peak` mode is better when you want Apple Silicon to search for a higher-performing kernel/thread combination.
+
+## Current Specialization
+
+- Apple Silicon has dedicated NEON peak kernels and per-test calibration.
+- Linux and Windows keep the portable fallback path.
 
 ## Out Of Scope In This Version
 
-This version does not implement:
+This version still does not implement:
 
 - Random latency measurement
-- Hand-written SIMD kernels
 - Non-temporal store benchmarks
-
-Those were intentionally removed from the documentation because they are not present in the current codebase.
+- Hardware-counter-based DRAM traffic validation

@@ -54,8 +54,6 @@ g++ --version
 
 ### macOS / Linux
 
-使用脚本：
-
 ```bash
 ./build.sh
 ```
@@ -69,24 +67,15 @@ cmake --build build
 
 ### Windows
 
-使用脚本：
-
 ```cmd
 build.bat
 ```
 
-或手动构建（Visual Studio）：
+或手动构建：
 
 ```cmd
 cmake -S . -B build
 cmake --build build --config Release
-```
-
-或手动构建（MinGW）：
-
-```cmd
-cmake -S . -B build -G "MinGW Makefiles"
-cmake --build build
 ```
 
 ## 运行程序
@@ -96,8 +85,8 @@ cmake --build build
 ```bash
 ./build/membench
 ./build/membench 1024
-./build/membench --size-mb 1024 --tests read,copy
-./build/membench --threads 4 --warmup 2 --iterations 7
+./build/membench --mode standard
+./build/membench --mode peak --size-mb 1024 --tests read,copy
 ```
 
 Windows:
@@ -105,7 +94,7 @@ Windows:
 ```cmd
 .\build\Release\membench.exe
 .\build\Release\membench.exe 1024
-.\build\Release\membench.exe --size-mb 1024 --thread-policy perf
+.\build\Release\membench.exe --mode standard
 ```
 
 ### 常用参数
@@ -115,7 +104,9 @@ Windows:
 - `--tests read,write,copy`：只运行部分测试
 - `--iterations <n>`：测量轮数
 - `--warmup <n>`：预热轮数
-- `--thread-policy perf|all`：线程策略
+- `--thread-policy perf|all`：限制线程搜索范围
+- `--mode standard|peak`：稳定模式或峰值模式
+- `--no-calibrate`：关闭峰值模式的短校准
 - `--no-qos`：关闭 macOS QoS 提示
 - `--help`：查看帮助
 
@@ -124,10 +115,33 @@ Windows:
 - 默认 buffer 大小：`min(1 GiB, 物理内存 / 8)`，下限 `256 MiB`
 - 默认测量轮数：`7`
 - 默认预热轮数：`2`
-- Apple Silicon 默认线程策略：`perf`
-- 其他平台默认线程策略：`all`
+- Apple Silicon 默认模式：`peak`
+- Apple Silicon 默认线程策略：`all`
+- 非 Apple Silicon 默认模式：`standard`
 
-## 准确性建议
+Apple Silicon 的 `peak` 模式会对每项测试单独做短校准，然后选择最优线程数和内核。
+
+## 结果说明
+
+每项测试都会输出：
+
+- `mode`
+- `kernel`
+- `selected_threads`
+- `calibrated`
+- `size_mb`
+- `logical_bytes_per_iteration`
+- `measured_elapsed_ms`
+- `avg / median / min / max / stdev bandwidth`
+
+`copy` 会额外输出两种带宽口径：
+
+- `logical ... bandwidth`：逻辑复制吞吐
+- `estimated traffic ... bandwidth`：逻辑吞吐乘以 2 的估算流量
+
+第二种口径只是为了更方便和芯片标称内存带宽对照，不等于硬件计数器观测值。
+
+## 使用建议
 
 1. 使用 Release 构建：
 
@@ -136,10 +150,20 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-2. 测试时尽量关闭后台内存密集型应用。
-3. 小 buffer 更容易被缓存影响；想看主内存带宽时优先使用较大尺寸。
-4. Apple Silicon 上 `--thread-policy perf` 通常比 `all` 更稳定。
-5. `copy` 输出的是逻辑复制吞吐，不会乘 2 去估算总 DRAM 流量。
+2. 想做稳定对比时，优先使用：
+
+```bash
+./build/membench --mode standard
+```
+
+3. 想尽量逼近 Apple Silicon 峰值时，直接运行默认命令或显式使用：
+
+```bash
+./build/membench --mode peak
+```
+
+4. 小 buffer 更容易被缓存影响；想看主内存带宽时优先使用较大尺寸。
+5. 测试时尽量关闭后台内存密集型应用。
 
 ## 故障排查
 
@@ -186,5 +210,6 @@ sudo apt-get install --only-upgrade cmake
 
 - 系统信息
 - benchmark 配置
-- `read` / `write` / `copy` 三类测试结果
-- `avg / median / min / max / stdev` 统计
+- `read` / `write` / `copy` 测试结果
+- Apple Silicon 上的 `mode`、`kernel`、`selected_threads`、`calibrated`
+- `copy` 的逻辑吞吐与估算流量两种输出
