@@ -38,6 +38,10 @@
 #include <arm_neon.h>
 #endif
 
+#ifdef MEMBENCH_HAS_METAL
+#include "metal_backend.h"
+#endif
+
 namespace {
 
 constexpr std::size_t KB = 1024;
@@ -70,6 +74,12 @@ enum class RunMode {
     Peak,
 };
 
+enum class Backend {
+    Cpu,
+    Metal,
+    Auto,
+};
+
 enum class KernelKind {
     ScalarAuto,
     NeonPeak,
@@ -77,6 +87,9 @@ enum class KernelKind {
     NeonStore,
     LibcMemcpy,
     NeonCopy,
+    MetalRead,
+    MetalWrite,
+    MetalCopy,
 };
 
 struct PlatformInfo {
@@ -94,6 +107,7 @@ struct BenchmarkOptions {
     unsigned int threads_override = 0;
     ThreadPolicy thread_policy = ThreadPolicy::All;
     RunMode mode = RunMode::Standard;
+    Backend backend = Backend::Cpu;
     bool calibrate = false;
     bool use_qos = false;
     std::vector<TestKind> tests;
@@ -187,6 +201,12 @@ std::string kernelToString(KernelKind kernel) {
             return "libc_memcpy";
         case KernelKind::NeonCopy:
             return "neon_copy";
+        case KernelKind::MetalRead:
+            return "metal_read";
+        case KernelKind::MetalWrite:
+            return "metal_write";
+        case KernelKind::MetalCopy:
+            return "metal_copy";
     }
     return "unknown";
 }
@@ -234,6 +254,34 @@ bool parseRunMode(const std::string& text, RunMode* mode) {
     }
     if (text == "peak") {
         *mode = RunMode::Peak;
+        return true;
+    }
+    return false;
+}
+
+std::string backendToString(Backend backend) {
+    switch (backend) {
+        case Backend::Cpu:   return "cpu";
+        case Backend::Metal: return "metal";
+        case Backend::Auto:  return "auto";
+    }
+    return "unknown";
+}
+
+bool parseBackend(const std::string& text, Backend* backend) {
+    if (backend == nullptr) {
+        return false;
+    }
+    if (text == "cpu") {
+        *backend = Backend::Cpu;
+        return true;
+    }
+    if (text == "metal") {
+        *backend = Backend::Metal;
+        return true;
+    }
+    if (text == "auto") {
+        *backend = Backend::Auto;
         return true;
     }
     return false;
@@ -401,6 +449,15 @@ bool kernelSupported(const PlatformInfo& platform, KernelKind kernel) {
         case KernelKind::NeonStore:
         case KernelKind::NeonCopy:
             return platform.apple_silicon;
+        case KernelKind::MetalRead:
+        case KernelKind::MetalWrite:
+        case KernelKind::MetalCopy:
+#ifdef MEMBENCH_HAS_METAL
+            return platform.apple_silicon && metalIsAvailable();
+#else
+            (void)platform;
+            return false;
+#endif
     }
     return false;
 }
@@ -454,29 +511,55 @@ std::vector<unsigned int> buildThreadCandidates(const PlatformInfo& platform,
     return candidates;
 }
 
-std::vector<KernelKind> buildKernelCandidates(const PlatformInfo& platform, TestKind kind) {
+std::vector<KernelKind> buildKernelCandidates(const PlatformInfo& platform,
+                                              TestKind kind,
+                                              Backend backend) {
     std::vector<KernelKind> kernels;
+    const bool want_cpu   = (backend == Backend::Cpu || backend == Backend::Auto);
+    const bool want_metal = (backend == Backend::Metal || backend == Backend::Auto);
+
     switch (kind) {
         case TestKind::Read:
-            kernels.push_back(KernelKind::ScalarAuto);
-            if (platform.apple_silicon) {
-                kernels.push_back(KernelKind::NeonPeak);
+            if (want_cpu) {
+                kernels.push_back(KernelKind::ScalarAuto);
+                if (platform.apple_silicon) {
+                    kernels.push_back(KernelKind::NeonPeak);
+                }
+            }
+            if (want_metal && kernelSupported(platform, KernelKind::MetalRead)) {
+                kernels.push_back(KernelKind::MetalRead);
             }
             break;
         case TestKind::Write:
-            kernels.push_back(KernelKind::LibcMemset);
-            if (platform.apple_silicon) {
-                kernels.push_back(KernelKind::NeonStore);
+            if (want_cpu) {
+                kernels.push_back(KernelKind::LibcMemset);
+                if (platform.apple_silicon) {
+                    kernels.push_back(KernelKind::NeonStore);
+                }
+            }
+            if (want_metal && kernelSupported(platform, KernelKind::MetalWrite)) {
+                kernels.push_back(KernelKind::MetalWrite);
             }
             break;
         case TestKind::Copy:
-            kernels.push_back(KernelKind::LibcMemcpy);
-            if (platform.apple_silicon) {
-                kernels.push_back(KernelKind::NeonCopy);
+            if (want_cpu) {
+                kernels.push_back(KernelKind::LibcMemcpy);
+                if (platform.apple_silicon) {
+                    kernels.push_back(KernelKind::NeonCopy);
+                }
+            }
+            if (want_metal && kernelSupported(platform, KernelKind::MetalCopy)) {
+                kernels.push_back(KernelKind::MetalCopy);
             }
             break;
     }
     return kernels;
+}
+
+bool isMetalKernel(KernelKind kernel) {
+    return kernel == KernelKind::MetalRead ||
+           kernel == KernelKind::MetalWrite ||
+           kernel == KernelKind::MetalCopy;
 }
 
 KernelKind chooseHeuristicKernel(const PlatformInfo& platform,
@@ -514,6 +597,8 @@ void printUsage(const char* program_name, const PlatformInfo& platform) {
               << kDefaultWarmupIterations << ")\n"
               << "  --thread-policy <p>   perf or all\n"
               << "  --mode <m>            standard or peak (default: " << default_mode << ")\n"
+              << "  --backend <b>         cpu, metal, or auto (default: "
+              << (platform.apple_silicon ? "auto" : "cpu") << ")\n"
               << "  --no-calibrate        Disable peak-mode kernel/thread calibration\n"
               << "  --no-qos              Disable macOS QoS hinting\n"
               << "  --help                Show this message\n\n"
@@ -545,6 +630,13 @@ void printSystemInfo(const PlatformInfo& platform) {
         } else {
             std::cout << "Performance cores: unavailable (falling back to conservative default)\n";
         }
+#ifdef MEMBENCH_HAS_METAL
+        if (metalIsAvailable()) {
+            std::cout << "Metal GPU: " << metalDeviceName() << '\n';
+        } else {
+            std::cout << "Metal GPU: unavailable\n";
+        }
+#endif
     }
     std::cout << '\n';
 }
@@ -1135,6 +1227,7 @@ public:
         std::cout << "Size: " << options_.size_bytes / MB << " MiB\n";
         std::cout << "Alignment: " << alignment_ << " bytes\n";
         std::cout << "Mode: " << runModeToString(options_.mode) << '\n';
+        std::cout << "Backend: " << backendToString(options_.backend) << '\n';
         std::cout << "Calibration: " << (isCalibrationEnabled() ? "enabled" : "disabled") << '\n';
         std::cout << "Warmup iterations: " << options_.warmup_iterations << '\n';
         std::cout << "Measured iterations: " << options_.measured_iterations << '\n';
@@ -1156,16 +1249,23 @@ public:
     void run() {
         for (TestKind kind : options_.tests) {
             const ExecutionPlan plan = selectExecutionPlan(kind);
-            BenchmarkRunner runner(platform_,
-                                   options_.mode,
-                                   options_.use_qos,
-                                   buffer_a_.data(),
-                                   buffer_b_.data(),
-                                   options_.size_bytes,
-                                   plan.selected_threads);
-            TestResult result = runner.run(
-                kind, plan.kernel, options_.warmup_iterations, options_.measured_iterations);
-            printTestResult(kind, plan, runner.threadCount(), result);
+
+            if (isMetalKernel(plan.kernel)) {
+#ifdef MEMBENCH_HAS_METAL
+                runMetalTest(kind, plan);
+#endif
+            } else {
+                BenchmarkRunner runner(platform_,
+                                       options_.mode,
+                                       options_.use_qos,
+                                       buffer_a_.data(),
+                                       buffer_b_.data(),
+                                       options_.size_bytes,
+                                       plan.selected_threads);
+                TestResult result = runner.run(
+                    kind, plan.kernel, options_.warmup_iterations, options_.measured_iterations);
+                printTestResult(kind, plan, runner.threadCount(), result);
+            }
         }
     }
 
@@ -1205,11 +1305,12 @@ private:
         const std::vector<unsigned int> thread_candidates =
             buildThreadCandidates(platform_, options_);
         const std::vector<KernelKind> kernel_candidates =
-            buildKernelCandidates(platform_, kind);
+            buildKernelCandidates(platform_, kind, options_.backend);
 
         const ExecutionPlan heuristic_plan = buildHeuristicPlan(kind);
         CalibrationCandidate best_candidate;
-        {
+
+        if (!isMetalKernel(heuristic_plan.kernel)) {
             BenchmarkRunner heuristic_runner(platform_,
                                              options_.mode,
                                              options_.use_qos,
@@ -1230,11 +1331,34 @@ private:
         }
 
         const double override_ratio = calibrationOverrideRatio(kind);
-        for (unsigned int requested_threads : thread_candidates) {
-            for (KernelKind kernel : kernel_candidates) {
-                if (!kernelSupported(platform_, kernel)) {
-                    continue;
+        for (KernelKind kernel : kernel_candidates) {
+            if (!kernelSupported(platform_, kernel)) {
+                continue;
+            }
+
+            if (isMetalKernel(kernel)) {
+#ifdef MEMBENCH_HAS_METAL
+                MetalTestKind mk = metalTestKindFor(kind);
+                MetalIterationResult mr = metalRunBandwidthTest(
+                    mk, calibration_size,
+                    kCalibrationWarmupIterations,
+                    kCalibrationMeasuredIterations);
+                double score = 0.0;
+                if (!mr.bandwidth_samples.empty()) {
+                    for (double s : mr.bandwidth_samples) score += s;
+                    score /= static_cast<double>(mr.bandwidth_samples.size());
                 }
+                if (score > best_candidate.score_mb_per_sec * override_ratio) {
+                    best_candidate.kernel = kernel;
+                    best_candidate.requested_threads = 0;
+                    best_candidate.actual_threads = 0;
+                    best_candidate.score_mb_per_sec = score;
+                }
+#endif
+                continue;
+            }
+
+            for (unsigned int requested_threads : thread_candidates) {
                 BenchmarkRunner runner(platform_,
                                        options_.mode,
                                        options_.use_qos,
@@ -1263,14 +1387,29 @@ private:
 
         ExecutionPlan plan;
         plan.kernel = best_candidate.kernel;
-        plan.selected_threads =
-            best_candidate.actual_threads > 0 ? best_candidate.actual_threads : buildHeuristicPlan(kind).selected_threads;
+        if (isMetalKernel(best_candidate.kernel)) {
+            plan.selected_threads = 0;
+        } else {
+            plan.selected_threads =
+                best_candidate.actual_threads > 0 ? best_candidate.actual_threads : buildHeuristicPlan(kind).selected_threads;
+        }
         plan.calibrated = true;
         return plan;
     }
 
     ExecutionPlan buildHeuristicPlan(TestKind kind) const {
         ExecutionPlan plan;
+
+        // If the user explicitly selected the Metal backend or if auto and
+        // Metal is available, prefer the Metal kernel.
+        if (options_.backend == Backend::Metal ||
+            (options_.backend == Backend::Auto && kernelSupported(platform_, metalKernelFor(kind)))) {
+            plan.kernel = metalKernelFor(kind);
+            plan.selected_threads = 0;  // GPU manages its own parallelism
+            plan.calibrated = false;
+            return plan;
+        }
+
         plan.kernel = chooseHeuristicKernel(platform_, options_, kind);
         if (options_.threads_override > 0) {
             plan.selected_threads = options_.threads_override;
@@ -1295,6 +1434,41 @@ private:
         return plan;
     }
 
+    static KernelKind metalKernelFor(TestKind kind) {
+        switch (kind) {
+            case TestKind::Read:  return KernelKind::MetalRead;
+            case TestKind::Write: return KernelKind::MetalWrite;
+            case TestKind::Copy:  return KernelKind::MetalCopy;
+        }
+        return KernelKind::MetalRead;
+    }
+
+#ifdef MEMBENCH_HAS_METAL
+    static MetalTestKind metalTestKindFor(TestKind kind) {
+        switch (kind) {
+            case TestKind::Read:  return MetalTestKind::Read;
+            case TestKind::Write: return MetalTestKind::Write;
+            case TestKind::Copy:  return MetalTestKind::Copy;
+        }
+        return MetalTestKind::Read;
+    }
+
+    void runMetalTest(TestKind kind, const ExecutionPlan& plan) {
+        MetalTestKind mk = metalTestKindFor(kind);
+        MetalIterationResult mr = metalRunBandwidthTest(
+            mk,
+            options_.size_bytes,
+            options_.warmup_iterations,
+            options_.measured_iterations);
+
+        TestResult result;
+        result.bandwidth_mb_per_sec = calculateStatistics(mr.bandwidth_samples);
+        result.elapsed_ms = calculateStatistics(mr.elapsed_samples);
+        result.logical_bytes_per_iteration = mr.logical_bytes_per_iteration;
+        printTestResult(kind, plan, 0, result);
+    }
+#endif
+
     void printBandwidthStats(const std::string& prefix, const Statistics& stats) const {
         std::cout << std::setprecision(2);
         std::cout << prefix << "avg bandwidth: " << (stats.average / 1024.0) << " GB/s ("
@@ -1316,7 +1490,11 @@ private:
         std::cout << "=== " << testKindToTitle(kind) << " Test ===\n";
         std::cout << "mode: " << runModeToString(options_.mode) << '\n';
         std::cout << "kernel: " << kernelToString(plan.kernel) << '\n';
-        std::cout << "selected_threads: " << actual_threads << '\n';
+        if (isMetalKernel(plan.kernel)) {
+            std::cout << "selected_threads: gpu\n";
+        } else {
+            std::cout << "selected_threads: " << actual_threads << '\n';
+        }
         std::cout << "calibrated: " << (plan.calibrated ? "yes" : "no") << '\n';
         std::cout << "size_mb: " << options_.size_bytes / MB << '\n';
         std::cout << "warmup: " << options_.warmup_iterations << '\n';
@@ -1357,6 +1535,11 @@ int main(int argc, char* argv[]) {
     options.thread_policy = platform.apple_silicon ? ThreadPolicy::All : ThreadPolicy::All;
     options.calibrate = platform.apple_silicon;
     options.use_qos = platform.apple_silicon;
+#ifdef MEMBENCH_HAS_METAL
+    options.backend = platform.apple_silicon ? Backend::Auto : Backend::Cpu;
+#else
+    options.backend = Backend::Cpu;
+#endif
     options.tests = {TestKind::Read, TestKind::Write, TestKind::Copy};
 
     bool positional_size_consumed = false;
@@ -1430,6 +1613,12 @@ int main(int argc, char* argv[]) {
                     throw std::runtime_error("invalid --mode value");
                 }
                 mode_explicit = true;
+                continue;
+            }
+            if (arg == "--backend") {
+                if (!parseBackend(requireValue(arg), &options.backend)) {
+                    throw std::runtime_error("invalid --backend value (use cpu, metal, or auto)");
+                }
                 continue;
             }
             if (arg == "--no-calibrate") {
