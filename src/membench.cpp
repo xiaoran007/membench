@@ -1246,13 +1246,24 @@ public:
         std::cout << "\n\n";
     }
 
+    struct SummaryEntry {
+        TestKind kind;
+        ExecutionPlan plan;
+        unsigned int actual_threads;
+        double avg_bandwidth_gb_per_sec;
+        double avg_traffic_gb_per_sec;  // copy only: 2x logical
+    };
+
     void run() {
+        std::vector<SummaryEntry> summary;
+
         for (TestKind kind : options_.tests) {
             const ExecutionPlan plan = selectExecutionPlan(kind);
 
             if (isMetalKernel(plan.kernel)) {
 #ifdef MEMBENCH_HAS_METAL
-                runMetalTest(kind, plan);
+                TestResult result = runMetalTest(kind, plan);
+                summary.push_back(makeSummaryEntry(kind, plan, 0, result));
 #endif
             } else {
                 BenchmarkRunner runner(platform_,
@@ -1265,7 +1276,12 @@ public:
                 TestResult result = runner.run(
                     kind, plan.kernel, options_.warmup_iterations, options_.measured_iterations);
                 printTestResult(kind, plan, runner.threadCount(), result);
+                summary.push_back(makeSummaryEntry(kind, plan, runner.threadCount(), result));
             }
+        }
+
+        if (summary.size() > 1) {
+            printSummary(summary);
         }
     }
 
@@ -1453,7 +1469,7 @@ private:
         return MetalTestKind::Read;
     }
 
-    void runMetalTest(TestKind kind, const ExecutionPlan& plan) {
+    TestResult runMetalTest(TestKind kind, const ExecutionPlan& plan) {
         MetalTestKind mk = metalTestKindFor(kind);
         MetalIterationResult mr = metalRunBandwidthTest(
             mk,
@@ -1466,8 +1482,54 @@ private:
         result.elapsed_ms = calculateStatistics(mr.elapsed_samples);
         result.logical_bytes_per_iteration = mr.logical_bytes_per_iteration;
         printTestResult(kind, plan, 0, result);
+        return result;
     }
 #endif
+
+    SummaryEntry makeSummaryEntry(TestKind kind,
+                                  const ExecutionPlan& plan,
+                                  unsigned int actual_threads,
+                                  const TestResult& result) const {
+        SummaryEntry entry;
+        entry.kind = kind;
+        entry.plan = plan;
+        entry.actual_threads = actual_threads;
+        entry.avg_bandwidth_gb_per_sec = result.bandwidth_mb_per_sec.average / 1024.0;
+        entry.avg_traffic_gb_per_sec =
+            (kind == TestKind::Copy) ? entry.avg_bandwidth_gb_per_sec * 2.0 : 0.0;
+        return entry;
+    }
+
+    void printSummary(const std::vector<SummaryEntry>& entries) const {
+        std::cout << "=== Summary ===\n";
+        for (const auto& e : entries) {
+            std::ostringstream line;
+            line << std::fixed << std::setprecision(2);
+
+            const std::string label = testKindToTitle(e.kind);
+            line << "  " << label << ":  ";
+
+            if (e.kind == TestKind::Copy) {
+                line << e.avg_bandwidth_gb_per_sec << " GB/s logical, "
+                     << e.avg_traffic_gb_per_sec << " GB/s traffic";
+            } else {
+                line << e.avg_bandwidth_gb_per_sec << " GB/s";
+            }
+
+            line << "  (" << kernelToString(e.plan.kernel);
+            if (isMetalKernel(e.plan.kernel)) {
+                line << ", gpu";
+            } else {
+                line << ", " << e.actual_threads << " threads";
+            }
+            if (e.plan.calibrated) {
+                line << ", calibrated";
+            }
+            line << ")";
+            std::cout << line.str() << '\n';
+        }
+        std::cout << '\n';
+    }
 
     void printBandwidthStats(const std::string& prefix, const Statistics& stats) const {
         std::cout << std::setprecision(2);
