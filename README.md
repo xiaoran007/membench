@@ -5,7 +5,7 @@ MemBench is a cross-platform memory bandwidth benchmark for `read`, `write`, and
 - `standard`: stable, conservative measurements
 - `peak`: Apple Silicon-first peak seeking with short auto-calibration
 
-On Apple Silicon, `./membench` now defaults to `peak` mode and tries to pick the best thread count and kernel per test.
+On Apple Silicon, `./membench` now defaults to `peak` mode with the `auto` backend, and tries to pick the best thread count, kernel, and backend (CPU or Metal GPU) per test.
 
 ## What It Measures
 
@@ -21,7 +21,8 @@ The benchmark uses:
 - Separate warmup and measured phases
 - Median and standard deviation in addition to average/min/max
 - Apple Silicon NEON peak kernels for selected paths
-- Per-test calibration in peak mode
+- Metal GPU compute shaders for bandwidth testing on Apple Silicon
+- Per-test calibration in peak mode (CPU vs GPU compete)
 
 ## Build Requirements
 
@@ -77,6 +78,8 @@ Useful examples:
 ./build/membench --mode peak --size-mb 1024 --tests read,copy
 ./build/membench --mode peak --no-calibrate
 ./build/membench --threads 4 --warmup 2 --iterations 7
+./build/membench --backend metal --tests read
+./build/membench --backend cpu --mode peak
 ```
 
 ### CLI Options
@@ -88,6 +91,7 @@ Useful examples:
 - `--warmup <n>`: warmup iterations per test
 - `--thread-policy perf|all`: constrain thread selection
 - `--mode standard|peak`: choose stable or peak-seeking behavior
+- `--backend cpu|metal|auto`: choose CPU-only, Metal GPU, or auto selection
 - `--no-calibrate`: disable peak-mode calibration
 - `--no-qos`: disable macOS QoS hints
 - `--help`: print usage
@@ -98,10 +102,12 @@ Useful examples:
 - Default measured iterations: `7`
 - Default warmup iterations: `2`
 - Default Apple Silicon mode: `peak`
+- Default Apple Silicon backend: `auto` (CPU and Metal GPU compete)
 - Default Apple Silicon thread policy: `all`
 - Default non-Apple mode: `standard`
+- Default non-Apple backend: `cpu`
 
-On Apple Silicon, peak mode calibrates each test independently and may choose different kernels and thread counts for `read`, `write`, and `copy`.
+On Apple Silicon, peak mode calibrates each test independently and may choose different kernels, thread counts, and backends (CPU or Metal GPU) for `read`, `write`, and `copy`.
 
 ## Interpreting Results
 
@@ -109,7 +115,7 @@ Each test prints:
 
 - `mode`
 - `kernel`
-- `selected_threads`
+- `selected_threads` (or `gpu` for Metal kernels)
 - `calibrated`
 - `size_mb`
 - `warmup`
@@ -135,6 +141,8 @@ The estimated traffic number is only a convenience for comparing with vendor mem
 ## Current Specialization
 
 - Apple Silicon has dedicated NEON peak kernels and per-test calibration.
+- Apple Silicon Metal GPU compute shaders for read/write/copy bandwidth testing.
+- In `auto` backend mode, CPU and Metal GPU kernels compete during calibration; the winner is used for the measured run.
 - Linux and Windows keep the portable fallback path.
 
 ## Out Of Scope In This Version
@@ -144,3 +152,4 @@ This version still does not implement:
 - Random latency measurement
 - Non-temporal store benchmarks
 - Hardware-counter-based DRAM traffic validation
+- Metal GPU bandwidth testing on non-Apple-Silicon Macs

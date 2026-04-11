@@ -105,6 +105,7 @@ Windows:
 - `--iterations <n>`：测量轮数
 - `--warmup <n>`：预热轮数
 - `--thread-policy perf|all`：限制线程搜索范围
+- `--backend cpu|metal|auto`：选择 CPU、Metal GPU 或自动选择
 - `--mode standard|peak`：稳定模式或峰值模式
 - `--no-calibrate`：关闭峰值模式的短校准
 - `--no-qos`：关闭 macOS QoS 提示
@@ -116,10 +117,12 @@ Windows:
 - 默认测量轮数：`7`
 - 默认预热轮数：`2`
 - Apple Silicon 默认模式：`peak`
+- Apple Silicon 默认后端：`auto`（CPU 和 Metal GPU 竞争选优）
 - Apple Silicon 默认线程策略：`all`
 - 非 Apple Silicon 默认模式：`standard`
+- 非 Apple Silicon 默认后端：`cpu`
 
-Apple Silicon 的 `peak` 模式会对每项测试单独做短校准，然后选择最优线程数和内核。
+Apple Silicon 的 `peak` 模式会对每项测试单独做短校准，然后在 CPU 和 Metal GPU 之间选择最优路径。
 
 ## 结果说明
 
@@ -164,6 +167,39 @@ cmake --build build
 
 4. 小 buffer 更容易被缓存影响；想看主内存带宽时优先使用较大尺寸。
 5. 测试时尽量关闭后台内存密集型应用。
+
+## Metal GPU 后端（Apple Silicon）
+
+在 Apple Silicon Mac 上，MemBench 自动编译并启用 Metal GPU 后端。Metal 计算着色器通过 GPU 路径测量内存带宽，利用 Apple Silicon 统一内存架构（UMA）直接读写 DRAM。
+
+### 前置条件
+
+- macOS 11.0 (Big Sur) 或更高版本
+- Xcode Command Line Tools（`xcode-select --install`）
+- 不需要完整安装 Xcode——Metal 着色器在运行时编译，无需 Metal Toolchain
+
+### 使用方式
+
+```bash
+# 自动选择最优后端（默认行为）
+./build/membench
+
+# 强制使用 Metal GPU
+./build/membench --backend metal
+
+# 强制使用 CPU
+./build/membench --backend cpu
+
+# Metal GPU 仅测试读带宽
+./build/membench --backend metal --tests read
+```
+
+### 工作原理
+
+- Metal 着色器源码内嵌在可执行文件中，运行时通过 `MTLLibrary` API 即时编译
+- 使用 `MTLResourceStorageModeShared` 缓冲区，UMA 下 CPU 和 GPU 零拷贝共享同一物理内存
+- 使用 GPU command buffer 时间戳（`GPUStartTime` / `GPUEndTime`）精确计时
+- 在 `auto` 后端模式下，Metal 和 CPU 内核参与同一 calibration 框架竞争，每项测试独立选择最优路径
 
 ## 故障排查
 
