@@ -35,6 +35,22 @@ if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
     else()
         message(STATUS "Compiler does not support -mcpu=native; using generic Apple Silicon codegen")
     endif()
+
+    # --- Metal GPU backend ---------------------------------------------------
+    # Shaders are compiled from source at runtime via newLibraryWithSource:,
+    # so no build-time Metal toolchain dependency is required.
+    enable_language(OBJCXX)
+
+    target_sources(membench PRIVATE src/metal_backend.mm)
+    set_source_files_properties(src/metal_backend.mm PROPERTIES
+        COMPILE_FLAGS "-fobjc-arc"
+    )
+    target_compile_definitions(membench PRIVATE MEMBENCH_HAS_METAL=1)
+    target_link_libraries(membench PRIVATE "-framework Metal" "-framework Foundation")
+
+    message(STATUS "Metal GPU backend enabled (runtime shader compilation)")
+    # -------------------------------------------------------------------------
+
 elseif((CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|i.86") OR
         (CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|i.86"))
     check_cxx_compiler_flag("-march=native" COMPILER_SUPPORTS_MARCH_NATIVE)
