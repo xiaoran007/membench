@@ -20,6 +20,10 @@ endif()
 add_executable(membench src/membench.cpp)
 target_include_directories(membench PRIVATE ${PROJECT_BINARY_DIR})
 
+if(WIN32)
+    target_compile_definitions(membench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 if(MSVC)
     target_compile_definitions(membench PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(membench PRIVATE /W4 "$<$<NOT:$<CONFIG:Debug>>:/O2>")
