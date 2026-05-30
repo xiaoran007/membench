@@ -1644,6 +1644,9 @@ private:
         if (!isCalibrationEnabled()) {
             return buildHeuristicPlan(kind);
         }
+        if (platform_.x86_avx2 && kind == TestKind::Read) {
+            return buildHeuristicPlan(kind);
+        }
 
         const std::size_t calibration_size = std::min(options_.size_bytes, kCalibrationBufferSize);
         const std::vector<unsigned int> thread_candidates =
