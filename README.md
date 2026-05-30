@@ -111,7 +111,7 @@ Useful examples:
 
 On Apple Silicon, peak mode calibrates each test independently and may choose different kernels, thread counts, and backends (CPU or Metal GPU) for `read`, `write`, and `copy`.
 
-On Linux/x86 AVX2 builds, peak mode calibrates `scalar_auto`, `libc_memset`, `libc_memcpy`, `avx2_read`, `avx2_stream_store`, and `avx2_stream_copy` candidates where applicable. The streaming-store write kernel avoids write-allocate traffic and can substantially improve large sequential write bandwidth on DDR5 systems.
+On Linux/x86 AVX2 builds, peak mode calibrates `scalar_auto`, `libc_memset`, `libc_memcpy`, `avx2_stream_store`, and `avx2_stream_copy` candidates where applicable. The streaming-store write kernel avoids write-allocate traffic and can substantially improve large sequential write bandwidth on DDR5 systems.
 
 ## Interpreting Results
 

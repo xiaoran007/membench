@@ -562,9 +562,6 @@ std::vector<KernelKind> buildKernelCandidates(const PlatformInfo& platform,
         case TestKind::Read:
             if (want_cpu) {
                 kernels.push_back(KernelKind::ScalarAuto);
-                if (kernelSupported(platform, KernelKind::Avx2Read)) {
-                    kernels.push_back(KernelKind::Avx2Read);
-                }
                 if (platform.apple_silicon) {
                     kernels.push_back(KernelKind::NeonPeak);
                 }
