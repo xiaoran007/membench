@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -26,6 +27,9 @@
 #include <windows.h>
 #else
 #include <pthread.h>
+#ifdef __linux__
+#include <sched.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 #endif
@@ -106,6 +110,7 @@ struct PlatformInfo {
     unsigned int performance_cores = 0;
     bool apple_silicon = false;
     bool x86_avx2 = false;
+    std::vector<unsigned int> cpu_affinity_order;
 };
 
 struct BenchmarkOptions {
@@ -379,6 +384,86 @@ std::uint64_t splitMix64(std::uint64_t value) {
     return value ^ (value >> 31U);
 }
 
+std::vector<unsigned int> parseCpuList(const std::string& text) {
+    std::vector<unsigned int> cpus;
+    std::stringstream stream(text);
+    std::string item;
+    while (std::getline(stream, item, ',')) {
+        const auto dash = item.find('-');
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        if (dash == std::string::npos) {
+            if (!parseUnsigned64(item, &begin)) {
+                continue;
+            }
+            end = begin;
+        } else {
+            if (!parseUnsigned64(item.substr(0, dash), &begin) ||
+                !parseUnsigned64(item.substr(dash + 1), &end) || end < begin) {
+                continue;
+            }
+        }
+        for (std::uint64_t cpu = begin; cpu <= end; ++cpu) {
+            if (cpu <= std::numeric_limits<unsigned int>::max()) {
+                cpus.push_back(static_cast<unsigned int>(cpu));
+            }
+        }
+    }
+    return cpus;
+}
+
+bool containsCpu(const std::vector<unsigned int>& cpus, unsigned int cpu) {
+    return std::find(cpus.begin(), cpus.end(), cpu) != cpus.end();
+}
+
+#ifdef __linux__
+std::vector<unsigned int> readThreadSiblings(unsigned int cpu) {
+    const std::string path = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
+                             "/topology/thread_siblings_list";
+    std::ifstream file(path);
+    std::string line;
+    if (!std::getline(file, line)) {
+        return {cpu};
+    }
+    return parseCpuList(line);
+}
+
+std::vector<unsigned int> detectPhysicalFirstCpuOrder() {
+    cpu_set_t allowed_set;
+    CPU_ZERO(&allowed_set);
+    if (sched_getaffinity(0, sizeof(allowed_set), &allowed_set) != 0) {
+        return {};
+    }
+
+    std::vector<unsigned int> allowed;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (CPU_ISSET(cpu, &allowed_set)) {
+            allowed.push_back(static_cast<unsigned int>(cpu));
+        }
+    }
+
+    std::vector<unsigned int> primary;
+    std::vector<unsigned int> secondary;
+    for (unsigned int cpu : allowed) {
+        const std::vector<unsigned int> siblings = readThreadSiblings(cpu);
+        unsigned int first_allowed_sibling = cpu;
+        for (unsigned int sibling : siblings) {
+            if (containsCpu(allowed, sibling)) {
+                first_allowed_sibling = std::min(first_allowed_sibling, sibling);
+            }
+        }
+        if (cpu == first_allowed_sibling) {
+            primary.push_back(cpu);
+        } else {
+            secondary.push_back(cpu);
+        }
+    }
+
+    primary.insert(primary.end(), secondary.begin(), secondary.end());
+    return primary;
+}
+#endif
+
 PlatformInfo detectPlatformInfo() {
     PlatformInfo info;
 #ifdef _WIN32
@@ -431,6 +516,10 @@ PlatformInfo detectPlatformInfo() {
 #endif
 #endif
 #endif
+#endif
+
+#ifdef __linux__
+    info.cpu_affinity_order = detectPhysicalFirstCpuOrder();
 #endif
 
     if (info.physical_memory_bytes == 0) {
@@ -691,6 +780,10 @@ void printSystemInfo(const PlatformInfo& platform) {
     if (platform.x86_avx2) {
         std::cout << "x86 AVX2: available\n";
     }
+    if (!platform.cpu_affinity_order.empty()) {
+        std::cout << "CPU affinity order: " << platform.cpu_affinity_order.size()
+                  << " logical CPUs, physical cores first\n";
+    }
     std::cout << '\n';
 }
 
@@ -810,7 +903,8 @@ public:
           buffer_a_(buffer_a),
           buffer_b_(buffer_b),
           size_bytes_(size_bytes),
-          thread_count_(resolveThreadCount(requested_threads)) {
+          thread_count_(resolveThreadCount(requested_threads)),
+          cpu_affinity_order_(platform.cpu_affinity_order) {
         buildSlices();
         startWorkers();
     }
@@ -959,7 +1053,22 @@ private:
 #endif
     }
 
+    void maybeApplyThreadAffinity(unsigned int worker_index) const {
+#ifdef __linux__
+        if (worker_index >= cpu_affinity_order_.size()) {
+            return;
+        }
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(cpu_affinity_order_[worker_index], &cpuset);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+#else
+        (void)worker_index;
+#endif
+    }
+
     void workerLoop(unsigned int worker_index, const Slice& slice) {
+        maybeApplyThreadAffinity(worker_index);
         maybeApplyThreadPolicy();
 
         std::size_t observed_command_generation = 0;
@@ -1407,6 +1516,7 @@ private:
     std::uint8_t* buffer_b_ = nullptr;
     std::size_t size_bytes_ = 0;
     unsigned int thread_count_ = 1;
+    std::vector<unsigned int> cpu_affinity_order_;
     std::vector<Slice> slices_;
     std::vector<std::thread> workers_;
 
@@ -1449,6 +1559,9 @@ public:
         if (options_.threads_override > 0) {
             std::cout << "Thread override: " << options_.threads_override << '\n';
         }
+        std::cout << "Worker affinity: "
+                  << (!platform_.cpu_affinity_order.empty() ? "physical-first" : "disabled")
+                  << '\n';
         std::cout << "macOS QoS hint: " << (options_.use_qos ? "enabled" : "disabled") << '\n';
         std::cout << "Tests: ";
         for (std::size_t index = 0; index < options_.tests.size(); ++index) {
@@ -1558,7 +1671,7 @@ private:
             best_candidate.kernel = heuristic_plan.kernel;
             best_candidate.requested_threads = heuristic_plan.selected_threads;
             best_candidate.actual_threads = heuristic_runner.threadCount();
-            best_candidate.score_mb_per_sec = heuristic_result.bandwidth_mb_per_sec.average;
+            best_candidate.score_mb_per_sec = heuristic_result.bandwidth_mb_per_sec.median;
         }
 
         std::size_t total_candidates = 0;
@@ -1593,8 +1706,7 @@ private:
                     kCalibrationMeasuredIterations);
                 double score = 0.0;
                 if (!mr.bandwidth_samples.empty()) {
-                    for (double s : mr.bandwidth_samples) score += s;
-                    score /= static_cast<double>(mr.bandwidth_samples.size());
+                    score = calculateStatistics(mr.bandwidth_samples).median;
                 }
                 if (score > best_candidate.score_mb_per_sec * override_ratio) {
                     best_candidate.kernel = kernel;
@@ -1623,7 +1735,7 @@ private:
                                                      kCalibrationWarmupIterations,
                                                      kCalibrationMeasuredIterations,
                                                      kCalibrationPassesPerIteration);
-                const double score = result.bandwidth_mb_per_sec.average;
+                const double score = result.bandwidth_mb_per_sec.median;
                 if (kernel == best_candidate.kernel &&
                     runner.threadCount() == best_candidate.actual_threads) {
                     continue;

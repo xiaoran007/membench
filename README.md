@@ -18,6 +18,7 @@ The benchmark uses:
 - Page-aligned buffers
 - One global timer per measured iteration
 - Reusable worker threads inside each runner
+- Linux worker affinity with physical cores preferred before SMT siblings
 - Separate warmup and measured phases
 - Median and standard deviation in addition to average/min/max
 - Apple Silicon NEON peak kernels for selected paths
@@ -111,7 +112,7 @@ Useful examples:
 
 On Apple Silicon, peak mode calibrates each test independently and may choose different kernels, thread counts, and backends (CPU or Metal GPU) for `read`, `write`, and `copy`.
 
-On Linux/x86 AVX2 builds, peak mode calibrates `scalar_auto`, `libc_memset`, `libc_memcpy`, `avx2_stream_store`, and `avx2_stream_copy` candidates where applicable. The streaming-store write kernel avoids write-allocate traffic and can substantially improve large sequential write bandwidth on DDR5 systems.
+On Linux/x86 AVX2 builds, peak mode calibrates `scalar_auto`, `libc_memset`, `libc_memcpy`, `avx2_stream_store`, and `avx2_stream_copy` candidates where applicable. Calibration scores candidates by median bandwidth. The streaming-store write kernel avoids write-allocate traffic and can substantially improve large sequential write bandwidth on DDR5 systems.
 
 ## Interpreting Results
 
@@ -148,6 +149,7 @@ The estimated traffic number is only a convenience for comparing with vendor mem
 - Apple Silicon Metal GPU compute shaders for read/write/copy bandwidth testing.
 - In `auto` backend mode, CPU and Metal GPU kernels compete during calibration; the winner is used for the measured run.
 - Linux/x86 AVX2 builds have calibrated CPU peak mode, including AVX2 streaming write/copy candidates.
+- Linux workers are pinned in a physical-core-first order when CPU topology is available.
 - Windows keeps the portable fallback path.
 
 ## Out Of Scope In This Version
