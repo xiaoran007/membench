@@ -356,6 +356,7 @@ public:
     explicit TuiReporter(bool unicode) : unicode_(unicode) {}
 
     ~TuiReporter() override {
+        leaveAlternateScreen();
         showCursor();
     }
 
@@ -366,19 +367,20 @@ public:
         platform_ = platform;
         options_ = options;
         start_time_ns_ = monotonicNowNsFallback();
+        enterAlternateScreen();
         hideCursor();
-        render();
+        render(true);
     }
 
     void beginAllocation(std::size_t size_bytes, std::size_t alignment) override {
         allocation_text_ = "allocating " + std::to_string(size_bytes / MB) +
                            " MiB per buffer, alignment " + std::to_string(alignment) + " bytes";
-        render();
+        render(true);
     }
 
     void finishInitialization() override {
         allocation_text_ = "buffers initialized with deterministic non-zero data";
-        render();
+        render(true);
     }
 
     void configuration(const PlatformInfo& platform,
@@ -389,7 +391,7 @@ public:
         options_ = options;
         alignment_ = alignment;
         calibration_enabled_ = calibration_enabled;
-        render();
+        render(true);
     }
 
     void beginCalibration(TestKind kind, std::size_t total_candidates) override {
@@ -401,7 +403,7 @@ public:
         focused_test_ = kind;
         focused_title_ = testKindToTitle(kind);
         focused_detail_ = "calibrating candidates";
-        render();
+        render(true);
     }
 
     void calibrationCandidate(const CalibrationProgress& progress) override {
@@ -419,7 +421,7 @@ public:
         focused_title_ = testKindToTitle(progress.kind);
         focused_detail_ = "current " + kernelToString(progress.kernel) +
                           threadText(progress.kernel, progress.threads);
-        render();
+        render(true);
     }
 
     void calibrationSelected(TestKind kind, const CalibrationCandidate& selected) override {
@@ -434,7 +436,7 @@ public:
         focused_title_ = testKindToTitle(kind);
         focused_detail_ = "selected " + kernelToString(selected.kernel) +
                           threadText(selected.kernel, selected.actual_threads);
-        render();
+        render(true);
     }
 
     void beginTest(TestKind kind, const ExecutionPlan& plan) override {
@@ -449,7 +451,7 @@ public:
         focused_title_ = testKindToTitle(kind);
         focused_detail_ = "measuring " + kernelToString(plan.kernel) +
                           threadText(plan.kernel, plan.selected_threads);
-        render();
+        render(true);
     }
 
     void testCompleted(TestKind kind,
@@ -470,19 +472,21 @@ public:
         focused_test_ = kind;
         focused_title_ = testKindToTitle(kind);
         focused_detail_ = "completed";
-        render();
+        render(true);
     }
 
     void summary(const std::vector<BenchmarkSummaryEntry>& entries) override {
         summary_ = entries;
-        render();
+        render(true);
     }
 
     void finishRun() override {
         finished_ = true;
         finish_time_ns_ = monotonicNowNsFallback();
-        render();
+        render(true);
+        leaveAlternateScreen();
         showCursor();
+        render(false);
     }
 
 private:
@@ -549,6 +553,20 @@ private:
 
     void showCursor() {
         std::cout << "\x1b[?25h" << std::flush;
+    }
+
+    void enterAlternateScreen() {
+        if (!alternate_screen_) {
+            std::cout << "\x1b[?1049h";
+            alternate_screen_ = true;
+        }
+    }
+
+    void leaveAlternateScreen() {
+        if (alternate_screen_) {
+            std::cout << "\x1b[?1049l";
+            alternate_screen_ = false;
+        }
     }
 
     static std::uint64_t monotonicNowNsFallback() {
@@ -650,8 +668,10 @@ private:
         std::cout << t.v << " " << truncate(text, width_ - 4) << " " << t.v << '\n';
     }
 
-    void render() {
-        std::cout << "\x1b[H\x1b[2J";
+    void render(bool clear_screen) {
+        if (clear_screen) {
+            std::cout << "\x1b[H\x1b[2J";
+        }
         renderHeader();
         line();
         renderConfiguration();
@@ -856,6 +876,7 @@ private:
     }
 
     bool unicode_ = true;
+    bool alternate_screen_ = false;
     const std::size_t width_ = 78;
     std::string version_;
     PlatformInfo platform_;

@@ -108,6 +108,7 @@ Useful examples:
 - Default measured iterations: `7`
 - Default warmup iterations: `2`
 - Default output: `auto`, which uses the Unicode ANSI TUI on capable terminals and falls back to plain text for unsupported terminals or redirected output
+- The ANSI TUI renders live updates in the terminal alternate screen and leaves only the final dashboard in scrollback.
 - Default Apple Silicon mode: `peak`
 - Default Apple Silicon backend: `auto` (CPU and Metal GPU compete)
 - Default Apple Silicon thread policy: `all`
