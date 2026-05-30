@@ -17,8 +17,17 @@ if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-add_executable(membench src/membench.cpp)
-target_include_directories(membench PRIVATE ${PROJECT_BINARY_DIR})
+set(MEMBENCH_SOURCES
+    src/membench.cpp
+    src/core/format.cpp
+    src/core/statistics.cpp
+)
+
+add_executable(membench ${MEMBENCH_SOURCES})
+target_include_directories(membench PRIVATE
+    ${PROJECT_BINARY_DIR}
+    ${PROJECT_SOURCE_DIR}/src
+)
 
 if(WIN32)
     target_compile_definitions(membench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)

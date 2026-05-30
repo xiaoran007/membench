@@ -1,9 +1,12 @@
 #include "version.h"
 
+#include "core/format.h"
+#include "core/statistics.h"
+#include "core/types.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -14,7 +17,6 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
-#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -52,183 +54,7 @@
 
 namespace {
 
-constexpr std::size_t KB = 1024;
-constexpr std::size_t MB = 1024 * KB;
-constexpr std::size_t GB = 1024 * MB;
-constexpr std::size_t kCacheLineSize = 64;
-constexpr std::size_t kDefaultWarmupIterations = 2;
-constexpr std::size_t kDefaultMeasuredIterations = 7;
-constexpr std::size_t kCalibrationWarmupIterations = 1;
-constexpr std::size_t kCalibrationMeasuredIterations = 3;
-constexpr std::size_t kCalibrationPassesPerIteration = 1;
-constexpr std::size_t kMinDefaultBufferSize = 256 * MB;
-constexpr std::size_t kMaxDefaultBufferSize = 1 * GB;
-constexpr std::size_t kCalibrationBufferSize = 1 * GB;
-constexpr std::size_t kMaxBufferSize = 16 * GB;
-
-enum class TestKind {
-    Read,
-    Write,
-    Copy,
-};
-
-enum class ThreadPolicy {
-    Perf,
-    All,
-};
-
-enum class RunMode {
-    Standard,
-    Peak,
-};
-
-enum class Backend {
-    Cpu,
-    Metal,
-    Auto,
-};
-
-enum class KernelKind {
-    ScalarAuto,
-    NeonPeak,
-    LibcMemset,
-    NeonStore,
-    LibcMemcpy,
-    NeonCopy,
-    Avx2Read,
-    Avx2StreamStore,
-    Avx2StreamCopy,
-    MetalRead,
-    MetalWrite,
-    MetalCopy,
-};
-
-struct PlatformInfo {
-    std::size_t page_size = 4096;
-    std::uint64_t physical_memory_bytes = 0;
-    unsigned int hardware_threads = 1;
-    unsigned int performance_cores = 0;
-    bool apple_silicon = false;
-    bool x86_avx2 = false;
-    std::vector<unsigned int> cpu_affinity_order;
-};
-
-struct BenchmarkOptions {
-    std::size_t size_bytes = 0;
-    std::size_t warmup_iterations = kDefaultWarmupIterations;
-    std::size_t measured_iterations = kDefaultMeasuredIterations;
-    unsigned int threads_override = 0;
-    ThreadPolicy thread_policy = ThreadPolicy::All;
-    RunMode mode = RunMode::Standard;
-    Backend backend = Backend::Cpu;
-    bool calibrate = false;
-    bool use_qos = false;
-    std::vector<TestKind> tests;
-};
-
-struct Statistics {
-    double average = 0.0;
-    double median = 0.0;
-    double minimum = 0.0;
-    double maximum = 0.0;
-    double stdev = 0.0;
-};
-
-struct TestResult {
-    Statistics bandwidth_mb_per_sec;
-    Statistics elapsed_ms;
-    std::size_t logical_bytes_per_iteration = 0;
-};
-
-struct ExecutionPlan {
-    KernelKind kernel = KernelKind::ScalarAuto;
-    unsigned int selected_threads = 1;
-    bool calibrated = false;
-};
-
-struct CalibrationCandidate {
-    KernelKind kernel = KernelKind::ScalarAuto;
-    unsigned int requested_threads = 1;
-    unsigned int actual_threads = 1;
-    double score_mb_per_sec = 0.0;
-};
-
-std::string formatBytes(std::uint64_t bytes) {
-    std::ostringstream oss;
-    oss << std::fixed << std::setprecision(2);
-    if (bytes >= GB) {
-        oss << (bytes / static_cast<double>(GB)) << " GiB";
-    } else if (bytes >= MB) {
-        oss << (bytes / static_cast<double>(MB)) << " MiB";
-    } else if (bytes >= KB) {
-        oss << (bytes / static_cast<double>(KB)) << " KiB";
-    } else {
-        oss << bytes << " B";
-    }
-    return oss.str();
-}
-
-std::string testKindToCliName(TestKind kind) {
-    switch (kind) {
-        case TestKind::Read:
-            return "read";
-        case TestKind::Write:
-            return "write";
-        case TestKind::Copy:
-            return "copy";
-    }
-    return "unknown";
-}
-
-std::string testKindToTitle(TestKind kind) {
-    switch (kind) {
-        case TestKind::Read:
-            return "Sequential Read";
-        case TestKind::Write:
-            return "Sequential Write";
-        case TestKind::Copy:
-            return "Memory Copy";
-    }
-    return "Unknown";
-}
-
-std::string threadPolicyToString(ThreadPolicy policy) {
-    return policy == ThreadPolicy::Perf ? "perf" : "all";
-}
-
-std::string runModeToString(RunMode mode) {
-    return mode == RunMode::Peak ? "peak" : "standard";
-}
-
-std::string kernelToString(KernelKind kernel) {
-    switch (kernel) {
-        case KernelKind::ScalarAuto:
-            return "scalar_auto";
-        case KernelKind::NeonPeak:
-            return "neon_peak";
-        case KernelKind::LibcMemset:
-            return "libc_memset";
-        case KernelKind::NeonStore:
-            return "neon_store";
-        case KernelKind::LibcMemcpy:
-            return "libc_memcpy";
-        case KernelKind::NeonCopy:
-            return "neon_copy";
-        case KernelKind::Avx2Read:
-            return "avx2_read";
-        case KernelKind::Avx2StreamStore:
-            return "avx2_stream_store";
-        case KernelKind::Avx2StreamCopy:
-            return "avx2_stream_copy";
-        case KernelKind::MetalRead:
-            return "metal_read";
-        case KernelKind::MetalWrite:
-            return "metal_write";
-        case KernelKind::MetalCopy:
-            return "metal_copy";
-    }
-    return "unknown";
-}
+using namespace membench;
 
 bool parseUnsigned64(const std::string& text, std::uint64_t* value) {
     if (value == nullptr || text.empty()) {
@@ -276,15 +102,6 @@ bool parseRunMode(const std::string& text, RunMode* mode) {
         return true;
     }
     return false;
-}
-
-std::string backendToString(Backend backend) {
-    switch (backend) {
-        case Backend::Cpu:   return "cpu";
-        case Backend::Metal: return "metal";
-        case Backend::Auto:  return "auto";
-    }
-    return "unknown";
 }
 
 bool parseBackend(const std::string& text, Backend* backend) {
@@ -336,45 +153,6 @@ bool parseTestList(const std::string& text, std::vector<TestKind>* tests) {
     parsed.erase(std::unique(parsed.begin(), parsed.end()), parsed.end());
     *tests = parsed;
     return true;
-}
-
-Statistics calculateStatistics(const std::vector<double>& values) {
-    if (values.empty()) {
-        return {};
-    }
-
-    Statistics stats;
-    stats.average = std::accumulate(values.begin(), values.end(), 0.0) /
-                    static_cast<double>(values.size());
-
-    std::vector<double> sorted = values;
-    std::sort(sorted.begin(), sorted.end());
-    const std::size_t midpoint = sorted.size() / 2;
-    if (sorted.size() % 2 == 0) {
-        stats.median = (sorted[midpoint - 1] + sorted[midpoint]) / 2.0;
-    } else {
-        stats.median = sorted[midpoint];
-    }
-    stats.minimum = sorted.front();
-    stats.maximum = sorted.back();
-
-    double squared_sum = 0.0;
-    for (double value : values) {
-        const double delta = value - stats.average;
-        squared_sum += delta * delta;
-    }
-    stats.stdev = std::sqrt(squared_sum / static_cast<double>(values.size()));
-    return stats;
-}
-
-Statistics scaleStatistics(const Statistics& stats, double factor) {
-    Statistics scaled = stats;
-    scaled.average *= factor;
-    scaled.median *= factor;
-    scaled.minimum *= factor;
-    scaled.maximum *= factor;
-    scaled.stdev *= factor;
-    return scaled;
 }
 
 std::uint64_t splitMix64(std::uint64_t value) {
