@@ -85,5 +85,34 @@ endif()
 
 install(TARGETS membench DESTINATION bin)
 
+enable_testing()
+
+add_executable(membench_unit_tests
+    tests/unit_tests.cpp
+    src/core/format.cpp
+    src/core/statistics.cpp
+    src/platform/platform.cpp
+    src/planner/execution_planner.cpp
+    src/kernels/kernel_registry.cpp
+)
+target_include_directories(membench_unit_tests PRIVATE
+    ${PROJECT_BINARY_DIR}
+    ${PROJECT_SOURCE_DIR}/src
+)
+if(WIN32)
+    target_compile_definitions(membench_unit_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+if(MSVC)
+    target_compile_definitions(membench_unit_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(membench_unit_tests PRIVATE /W4 "$<$<NOT:$<CONFIG:Debug>>:/O2>")
+else()
+    target_compile_options(membench_unit_tests PRIVATE -Wall -Wextra "$<$<NOT:$<CONFIG:Debug>>:-O3>")
+endif()
+if(UNIX AND NOT APPLE)
+    target_link_libraries(membench_unit_tests PRIVATE Threads::Threads)
+endif()
+
+add_test(NAME membench_unit_tests COMMAND membench_unit_tests)
+
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "C++ compiler: ${CMAKE_CXX_COMPILER}")
