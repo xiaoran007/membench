@@ -1,6 +1,7 @@
 #ifndef MEMBENCH_APP_MEMORY_BENCHMARK_H
 #define MEMBENCH_APP_MEMORY_BENCHMARK_H
 
+#include "backends/cpu_backend.h"
 #include "core/format.h"
 #include "core/random.h"
 #include "core/statistics.h"
@@ -8,7 +9,6 @@
 #include "kernels/kernel_registry.h"
 #include "memory/aligned_buffer.h"
 #include "planner/execution_planner.h"
-#include "runner/benchmark_runner.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -83,17 +83,19 @@ public:
                 summary.push_back(makeSummaryEntry(kind, plan, 0, result));
 #endif
             } else {
-                BenchmarkRunner runner(platform_,
-                                       options_.mode,
-                                       options_.use_qos,
-                                       buffer_a_.data(),
-                                       buffer_b_.data(),
-                                       options_.size_bytes,
-                                       plan.selected_threads);
-                TestResult result = runner.run(
-                    kind, plan.kernel, options_.warmup_iterations, options_.measured_iterations);
-                printTestResult(kind, plan, runner.threadCount(), result);
-                summary.push_back(makeSummaryEntry(kind, plan, runner.threadCount(), result));
+                CpuBackend backend(platform_,
+                                   options_.mode,
+                                   options_.use_qos,
+                                   buffer_a_.data(),
+                                   buffer_b_.data(),
+                                   options_.size_bytes);
+                const CpuBackendResult output = backend.run(kind,
+                                                            plan.kernel,
+                                                            options_.warmup_iterations,
+                                                            options_.measured_iterations,
+                                                            plan.selected_threads);
+                printTestResult(kind, plan, output.actual_threads, output.result);
+                summary.push_back(makeSummaryEntry(kind, plan, output.actual_threads, output.result));
             }
         }
 
@@ -157,23 +159,23 @@ private:
         CalibrationCandidate best_candidate;
 
         if (!isMetalKernel(heuristic_plan.kernel)) {
-            BenchmarkRunner heuristic_runner(platform_,
-                                             options_.mode,
-                                             options_.use_qos,
-                                             buffer_a_.data(),
-                                             buffer_b_.data(),
-                                             calibration_size,
-                                             heuristic_plan.selected_threads);
-            const TestResult heuristic_result =
-                heuristic_runner.run(kind,
-                                     heuristic_plan.kernel,
-                                     kCalibrationWarmupIterations,
-                                     kCalibrationMeasuredIterations,
-                                     kCalibrationPassesPerIteration);
+            CpuBackend heuristic_backend(platform_,
+                                         options_.mode,
+                                         options_.use_qos,
+                                         buffer_a_.data(),
+                                         buffer_b_.data(),
+                                         calibration_size);
+            const CpuBackendResult heuristic_output =
+                heuristic_backend.run(kind,
+                                      heuristic_plan.kernel,
+                                      kCalibrationWarmupIterations,
+                                      kCalibrationMeasuredIterations,
+                                      heuristic_plan.selected_threads,
+                                      kCalibrationPassesPerIteration);
             best_candidate.kernel = heuristic_plan.kernel;
             best_candidate.requested_threads = heuristic_plan.selected_threads;
-            best_candidate.actual_threads = heuristic_runner.threadCount();
-            best_candidate.score_mb_per_sec = heuristic_result.bandwidth_mb_per_sec.median;
+            best_candidate.actual_threads = heuristic_output.actual_threads;
+            best_candidate.score_mb_per_sec = heuristic_output.result.bandwidth_mb_per_sec.median;
         }
 
         std::size_t total_candidates = 0;
@@ -221,31 +223,31 @@ private:
             }
 
             for (unsigned int requested_threads : thread_candidates) {
-                BenchmarkRunner runner(platform_,
-                                       options_.mode,
-                                       options_.use_qos,
-                                       buffer_a_.data(),
-                                       buffer_b_.data(),
-                                       calibration_size,
-                                       requested_threads);
+                CpuBackend backend(platform_,
+                                   options_.mode,
+                                   options_.use_qos,
+                                   buffer_a_.data(),
+                                   buffer_b_.data(),
+                                   calibration_size);
                 ++completed_candidates;
+                const CpuBackendResult output = backend.run(kind,
+                                                            kernel,
+                                                            kCalibrationWarmupIterations,
+                                                            kCalibrationMeasuredIterations,
+                                                            requested_threads,
+                                                            kCalibrationPassesPerIteration);
                 std::cout << "\r  candidate " << completed_candidates << '/'
                           << total_candidates << ": " << kernelToString(kernel)
-                          << ", " << runner.threadCount() << " threads" << std::flush;
-                const TestResult result = runner.run(kind,
-                                                     kernel,
-                                                     kCalibrationWarmupIterations,
-                                                     kCalibrationMeasuredIterations,
-                                                     kCalibrationPassesPerIteration);
-                const double score = result.bandwidth_mb_per_sec.median;
+                          << ", " << output.actual_threads << " threads" << std::flush;
+                const double score = output.result.bandwidth_mb_per_sec.median;
                 if (kernel == best_candidate.kernel &&
-                    runner.threadCount() == best_candidate.actual_threads) {
+                    output.actual_threads == best_candidate.actual_threads) {
                     continue;
                 }
                 if (score > best_candidate.score_mb_per_sec * override_ratio) {
                     best_candidate.kernel = kernel;
                     best_candidate.requested_threads = requested_threads;
-                    best_candidate.actual_threads = runner.threadCount();
+                    best_candidate.actual_threads = output.actual_threads;
                     best_candidate.score_mb_per_sec = score;
                 }
             }
