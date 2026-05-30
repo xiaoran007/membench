@@ -5,6 +5,7 @@
 #include "core/types.h"
 #include "platform/platform.h"
 #include "planner/execution_planner.h"
+#include "reporting/benchmark_reporter.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -12,14 +13,11 @@
 #include <exception>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
-
-#ifdef MEMBENCH_HAS_METAL
-#include "metal_backend.h"
-#endif
 
 namespace {
 
@@ -92,6 +90,44 @@ bool parseBackend(const std::string& text, Backend* backend) {
     return false;
 }
 
+bool parseOutputMode(const std::string& text, OutputMode* mode) {
+    if (mode == nullptr) {
+        return false;
+    }
+    if (text == "auto") {
+        *mode = OutputMode::Auto;
+        return true;
+    }
+    if (text == "plain") {
+        *mode = OutputMode::Plain;
+        return true;
+    }
+    if (text == "tui") {
+        *mode = OutputMode::Tui;
+        return true;
+    }
+    return false;
+}
+
+bool parseTuiStyle(const std::string& text, TuiStyle* style) {
+    if (style == nullptr) {
+        return false;
+    }
+    if (text == "auto") {
+        *style = TuiStyle::Auto;
+        return true;
+    }
+    if (text == "unicode") {
+        *style = TuiStyle::Unicode;
+        return true;
+    }
+    if (text == "ascii") {
+        *style = TuiStyle::Ascii;
+        return true;
+    }
+    return false;
+}
+
 bool parseTestList(const std::string& text, std::vector<TestKind>* tests) {
     if (tests == nullptr || text.empty()) {
         return false;
@@ -141,6 +177,10 @@ void printUsage(const char* program_name, const PlatformInfo& platform) {
               << "  --mode <m>            standard or peak (default: " << default_mode << ")\n"
               << "  --backend <b>         cpu, metal, or auto (default: "
               << (platform.apple_silicon ? "auto" : "cpu") << ")\n"
+              << "  --output <m>          auto, tui, or plain (default: auto; prefers TUI)\n"
+              << "  --tui                 Alias for --output tui\n"
+              << "  --plain               Alias for --output plain\n"
+              << "  --tui-style <s>       auto, unicode, or ascii (default: auto; prefers unicode)\n"
               << "  --no-calibrate        Disable peak-mode kernel/thread calibration\n"
               << "  --no-qos              Disable macOS QoS hinting\n"
               << "  --help                Show this message\n\n"
@@ -151,46 +191,6 @@ void printUsage(const char* program_name, const PlatformInfo& platform) {
               << "  " << program_name
               << " --threads 4 --warmup 2 --iterations 7 --thread-policy all\n";
 }
-
-void printSystemInfo(const PlatformInfo& platform) {
-    std::cout << "=== System Information ===\n";
-#ifdef _WIN32
-    std::cout << "Operating System: Windows\n";
-#elif defined(__APPLE__)
-    std::cout << "Operating System: macOS\n";
-#elif defined(__linux__)
-    std::cout << "Operating System: Linux\n";
-#else
-    std::cout << "Operating System: Unknown\n";
-#endif
-    std::cout << "Page size: " << platform.page_size << " bytes\n";
-    std::cout << "Physical memory: " << formatBytes(platform.physical_memory_bytes) << '\n';
-    std::cout << "Hardware threads: " << platform.hardware_threads << '\n';
-    if (platform.apple_silicon) {
-        if (platform.performance_cores > 0) {
-            std::cout << "Performance cores: " << platform.performance_cores << '\n';
-        } else {
-            std::cout << "Performance cores: unavailable (falling back to conservative default)\n";
-        }
-#ifdef MEMBENCH_HAS_METAL
-        if (metalIsAvailable()) {
-            std::cout << "Metal GPU: " << metalDeviceName() << '\n';
-        } else {
-            std::cout << "Metal GPU: unavailable\n";
-        }
-#endif
-    }
-    if (platform.x86_avx2) {
-        std::cout << "x86 AVX2: available\n";
-    }
-    if (!platform.cpu_affinity_order.empty()) {
-        std::cout << "CPU affinity order: " << platform.cpu_affinity_order.size()
-                  << " logical CPUs, physical cores first\n";
-    }
-    std::cout << '\n';
-}
-
-
 
 }  // namespace
 
@@ -211,6 +211,8 @@ int main(int argc, char* argv[]) {
     options.backend = Backend::Cpu;
 #endif
     options.tests = {TestKind::Read, TestKind::Write, TestKind::Copy};
+    OutputMode output_mode = OutputMode::Auto;
+    TuiStyle tui_style = TuiStyle::Auto;
 
     bool positional_size_consumed = false;
     bool mode_explicit = false;
@@ -291,6 +293,26 @@ int main(int argc, char* argv[]) {
                 }
                 continue;
             }
+            if (arg == "--output") {
+                if (!parseOutputMode(requireValue(arg), &output_mode)) {
+                    throw std::runtime_error("invalid --output value (use auto, tui, or plain)");
+                }
+                continue;
+            }
+            if (arg == "--tui") {
+                output_mode = OutputMode::Tui;
+                continue;
+            }
+            if (arg == "--plain") {
+                output_mode = OutputMode::Plain;
+                continue;
+            }
+            if (arg == "--tui-style") {
+                if (!parseTuiStyle(requireValue(arg), &tui_style)) {
+                    throw std::runtime_error("invalid --tui-style value (use auto, unicode, or ascii)");
+                }
+                continue;
+            }
             if (arg == "--no-calibrate") {
                 options.calibrate = false;
                 continue;
@@ -334,15 +356,16 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::cout << "========================================\n";
-    std::cout << "MemBench v" << MEMBENCH_VERSION << '\n';
-    std::cout << "Memory Read/Write/Copy Benchmark\n";
-    std::cout << "========================================\n\n";
-
-    printSystemInfo(platform);
+    std::unique_ptr<BenchmarkReporter> reporter;
+    if (shouldUseTui(output_mode)) {
+        reporter = std::make_unique<TuiReporter>(shouldUseUnicodeTui(tui_style));
+    } else {
+        reporter = std::make_unique<PlainReporter>();
+    }
+    reporter->beginRun(MEMBENCH_VERSION, platform, options);
 
     try {
-        MemoryBenchmark benchmark(platform, options);
+        MemoryBenchmark benchmark(platform, options, *reporter);
         benchmark.printConfiguration();
         benchmark.run();
     } catch (const std::exception& ex) {

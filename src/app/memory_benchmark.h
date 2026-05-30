@@ -9,6 +9,7 @@
 #include "kernels/kernel_registry.h"
 #include "memory/aligned_buffer.h"
 #include "planner/execution_planner.h"
+#include "reporting/benchmark_reporter.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -27,55 +28,31 @@ namespace membench {
 
 class MemoryBenchmark {
 public:
-    MemoryBenchmark(const PlatformInfo& platform, const BenchmarkOptions& options)
+    MemoryBenchmark(const PlatformInfo& platform,
+                    const BenchmarkOptions& options,
+                    BenchmarkReporter& reporter)
         : platform_(platform),
           options_(options),
+          reporter_(reporter),
           alignment_(std::max(platform.page_size, kCacheLineSize)),
-          buffer_a_(options.size_bytes, alignment_),
-          buffer_b_(options.size_bytes, alignment_) {
+          buffer_a_(),
+          buffer_b_() {
+        reporter_.beginAllocation(options_.size_bytes, alignment_);
+        buffer_a_ = AlignedBuffer(options_.size_bytes, alignment_);
+        buffer_b_ = AlignedBuffer(options_.size_bytes, alignment_);
         initializeBuffers();
     }
 
     void printConfiguration() const {
-        std::cout << "=== Benchmark Configuration ===\n";
-        std::cout << "Size: " << options_.size_bytes / MB << " MiB\n";
-        std::cout << "Alignment: " << alignment_ << " bytes\n";
-        std::cout << "Mode: " << runModeToString(options_.mode) << '\n';
-        std::cout << "Backend: " << backendToString(options_.backend) << '\n';
-        std::cout << "Calibration: " << (isCalibrationEnabled() ? "enabled" : "disabled") << '\n';
-        std::cout << "Warmup iterations: " << options_.warmup_iterations << '\n';
-        std::cout << "Measured iterations: " << options_.measured_iterations << '\n';
-        std::cout << "Thread policy: " << threadPolicyToString(options_.thread_policy) << '\n';
-        if (options_.threads_override > 0) {
-            std::cout << "Thread override: " << options_.threads_override << '\n';
-        }
-        std::cout << "Worker affinity: "
-                  << (!platform_.cpu_affinity_order.empty() ? "physical-first" : "disabled")
-                  << '\n';
-        std::cout << "macOS QoS hint: " << (options_.use_qos ? "enabled" : "disabled") << '\n';
-        std::cout << "Tests: ";
-        for (std::size_t index = 0; index < options_.tests.size(); ++index) {
-            if (index > 0) {
-                std::cout << ',';
-            }
-            std::cout << testKindToCliName(options_.tests[index]);
-        }
-        std::cout << "\n\n";
+        reporter_.configuration(platform_, options_, alignment_, isCalibrationEnabled());
     }
 
-    struct SummaryEntry {
-        TestKind kind;
-        ExecutionPlan plan;
-        unsigned int actual_threads;
-        double avg_bandwidth_gb_per_sec;
-        double avg_traffic_gb_per_sec;  // copy only: 2x logical
-    };
-
     void run() {
-        std::vector<SummaryEntry> summary;
+        std::vector<BenchmarkSummaryEntry> summary;
 
         for (TestKind kind : options_.tests) {
             const ExecutionPlan plan = selectExecutionPlan(kind);
+            reporter_.beginTest(kind, plan);
 
             if (isMetalKernel(plan.kernel)) {
 #ifdef MEMBENCH_HAS_METAL
@@ -94,14 +71,13 @@ public:
                                                             options_.warmup_iterations,
                                                             options_.measured_iterations,
                                                             plan.selected_threads);
-                printTestResult(kind, plan, output.actual_threads, output.result);
+                reporter_.testCompleted(kind, plan, output.actual_threads, output.result);
                 summary.push_back(makeSummaryEntry(kind, plan, output.actual_threads, output.result));
             }
         }
 
-        if (summary.size() > 1) {
-            printSummary(summary);
-        }
+        reporter_.summary(summary);
+        reporter_.finishRun();
     }
 
 private:
@@ -111,7 +87,6 @@ private:
     }
 
     void initializeBuffers() {
-        std::cout << "Allocating " << options_.size_bytes / MB << " MiB per buffer..." << std::endl;
         auto* words_a = reinterpret_cast<std::uint64_t*>(buffer_a_.data());
         auto* words_b = reinterpret_cast<std::uint64_t*>(buffer_b_.data());
         const std::size_t word_count = options_.size_bytes / sizeof(std::uint64_t);
@@ -129,7 +104,7 @@ private:
 
         doNotOptimize(words_a[0]);
         doNotOptimize(words_b[0]);
-        std::cout << "Buffers initialized with deterministic non-zero data.\n\n";
+        reporter_.finishInitialization();
     }
 
     ExecutionPlan selectExecutionPlan(TestKind kind) {
@@ -187,10 +162,7 @@ private:
         }
 
         std::size_t completed_candidates = 0;
-        if (total_candidates > 0) {
-            std::cout << "Calibrating " << testKindToTitle(kind) << " ("
-                      << total_candidates << " candidates)...\n";
-        }
+        reporter_.beginCalibration(kind, total_candidates);
 
         const double override_ratio = calibrationOverrideRatio(platform_, kind);
         for (KernelKind kernel : kernel_candidates) {
@@ -201,8 +173,6 @@ private:
             if (isMetalKernel(kernel)) {
 #ifdef MEMBENCH_HAS_METAL
                 ++completed_candidates;
-                std::cout << "\r  candidate " << completed_candidates << '/'
-                          << total_candidates << ": " << kernelToString(kernel) << std::flush;
                 MetalTestKind mk = metalTestKindFor(kind);
                 MetalIterationResult mr = metalRunBandwidthTest(
                     mk, calibration_size,
@@ -218,6 +188,15 @@ private:
                     best_candidate.actual_threads = 0;
                     best_candidate.score_mb_per_sec = score;
                 }
+                reporter_.calibrationCandidate(
+                    {kind,
+                     kernel,
+                     0,
+                     completed_candidates,
+                     total_candidates,
+                     best_candidate.score_mb_per_sec,
+                     best_candidate.kernel,
+                     best_candidate.actual_threads});
 #endif
                 continue;
             }
@@ -236,12 +215,18 @@ private:
                                                             kCalibrationMeasuredIterations,
                                                             requested_threads,
                                                             kCalibrationPassesPerIteration);
-                std::cout << "\r  candidate " << completed_candidates << '/'
-                          << total_candidates << ": " << kernelToString(kernel)
-                          << ", " << output.actual_threads << " threads" << std::flush;
                 const double score = output.result.bandwidth_mb_per_sec.median;
                 if (kernel == best_candidate.kernel &&
                     output.actual_threads == best_candidate.actual_threads) {
+                    reporter_.calibrationCandidate(
+                        {kind,
+                         kernel,
+                         output.actual_threads,
+                         completed_candidates,
+                         total_candidates,
+                         best_candidate.score_mb_per_sec,
+                         best_candidate.kernel,
+                         best_candidate.actual_threads});
                     continue;
                 }
                 if (score > best_candidate.score_mb_per_sec * override_ratio) {
@@ -250,17 +235,18 @@ private:
                     best_candidate.actual_threads = output.actual_threads;
                     best_candidate.score_mb_per_sec = score;
                 }
+                reporter_.calibrationCandidate(
+                    {kind,
+                     kernel,
+                     output.actual_threads,
+                     completed_candidates,
+                     total_candidates,
+                     best_candidate.score_mb_per_sec,
+                     best_candidate.kernel,
+                     best_candidate.actual_threads});
             }
         }
-        if (total_candidates > 0) {
-            std::cout << "\r  selected " << kernelToString(best_candidate.kernel);
-            if (!isMetalKernel(best_candidate.kernel)) {
-                std::cout << ", " << best_candidate.actual_threads << " threads";
-            }
-            std::cout << " at " << std::fixed << std::setprecision(2)
-                      << (best_candidate.score_mb_per_sec / 1024.0) << " GB/s"
-                      << "                      \n";
-        }
+        reporter_.calibrationSelected(kind, best_candidate);
 
         ExecutionPlan plan;
         plan.kernel = best_candidate.kernel;
@@ -345,16 +331,16 @@ private:
         result.bandwidth_mb_per_sec = calculateStatistics(mr.bandwidth_samples);
         result.elapsed_ms = calculateStatistics(mr.elapsed_samples);
         result.logical_bytes_per_iteration = mr.logical_bytes_per_iteration;
-        printTestResult(kind, plan, 0, result);
+        reporter_.testCompleted(kind, plan, 0, result);
         return result;
     }
 #endif
 
-    SummaryEntry makeSummaryEntry(TestKind kind,
-                                  const ExecutionPlan& plan,
-                                  unsigned int actual_threads,
-                                  const TestResult& result) const {
-        SummaryEntry entry;
+    BenchmarkSummaryEntry makeSummaryEntry(TestKind kind,
+                                           const ExecutionPlan& plan,
+                                           unsigned int actual_threads,
+                                           const TestResult& result) const {
+        BenchmarkSummaryEntry entry;
         entry.kind = kind;
         entry.plan = plan;
         entry.actual_threads = actual_threads;
@@ -364,85 +350,9 @@ private:
         return entry;
     }
 
-    void printSummary(const std::vector<SummaryEntry>& entries) const {
-        std::cout << "=== Summary ===\n";
-        for (const auto& e : entries) {
-            std::ostringstream line;
-            line << std::fixed << std::setprecision(2);
-
-            const std::string label = testKindToTitle(e.kind);
-            line << "  " << label << ":  ";
-
-            if (e.kind == TestKind::Copy) {
-                line << e.avg_bandwidth_gb_per_sec << " GB/s logical, "
-                     << e.avg_traffic_gb_per_sec << " GB/s traffic";
-            } else {
-                line << e.avg_bandwidth_gb_per_sec << " GB/s";
-            }
-
-            line << "  (" << kernelToString(e.plan.kernel);
-            if (isMetalKernel(e.plan.kernel)) {
-                line << ", gpu";
-            } else {
-                line << ", " << e.actual_threads << " threads";
-            }
-            if (e.plan.calibrated) {
-                line << ", calibrated";
-            }
-            line << ")";
-            std::cout << line.str() << '\n';
-        }
-        std::cout << '\n';
-    }
-
-    void printBandwidthStats(const std::string& prefix, const Statistics& stats) const {
-        std::cout << std::setprecision(2);
-        std::cout << prefix << "avg bandwidth: " << (stats.average / 1024.0) << " GB/s ("
-                  << stats.average << " MB/s)\n";
-        std::cout << prefix << "median bandwidth: " << (stats.median / 1024.0) << " GB/s ("
-                  << stats.median << " MB/s)\n";
-        std::cout << prefix << "min bandwidth: " << (stats.minimum / 1024.0) << " GB/s ("
-                  << stats.minimum << " MB/s)\n";
-        std::cout << prefix << "max bandwidth: " << (stats.maximum / 1024.0) << " GB/s ("
-                  << stats.maximum << " MB/s)\n";
-        std::cout << prefix << "stdev bandwidth: " << (stats.stdev / 1024.0) << " GB/s ("
-                  << stats.stdev << " MB/s)\n";
-    }
-
-    void printTestResult(TestKind kind,
-                         const ExecutionPlan& plan,
-                         unsigned int actual_threads,
-                         const TestResult& result) const {
-        std::cout << "=== " << testKindToTitle(kind) << " Test ===\n";
-        std::cout << "mode: " << runModeToString(options_.mode) << '\n';
-        std::cout << "kernel: " << kernelToString(plan.kernel) << '\n';
-        if (isMetalKernel(plan.kernel)) {
-            std::cout << "selected_threads: gpu\n";
-        } else {
-            std::cout << "selected_threads: " << actual_threads << '\n';
-        }
-        std::cout << "calibrated: " << (plan.calibrated ? "yes" : "no") << '\n';
-        std::cout << "size_mb: " << options_.size_bytes / MB << '\n';
-        std::cout << "warmup: " << options_.warmup_iterations << '\n';
-        std::cout << "iterations: " << options_.measured_iterations << '\n';
-        std::cout << "logical_bytes_per_iteration: " << result.logical_bytes_per_iteration << " ("
-                  << formatBytes(result.logical_bytes_per_iteration) << ")\n";
-        std::cout << "measured_elapsed_ms: avg " << std::fixed << std::setprecision(3)
-                  << result.elapsed_ms.average << ", median " << result.elapsed_ms.median << '\n';
-
-        if (kind == TestKind::Copy) {
-            printBandwidthStats("logical ", result.bandwidth_mb_per_sec);
-            const Statistics traffic = scaleStatistics(result.bandwidth_mb_per_sec, 2.0);
-            printBandwidthStats("estimated traffic ", traffic);
-            std::cout << "Estimated traffic bandwidth is logical memcpy throughput multiplied by 2.\n";
-        } else {
-            printBandwidthStats("", result.bandwidth_mb_per_sec);
-        }
-        std::cout << '\n';
-    }
-
     PlatformInfo platform_;
     BenchmarkOptions options_;
+    BenchmarkReporter& reporter_;
     std::size_t alignment_ = 0;
     AlignedBuffer buffer_a_;
     AlignedBuffer buffer_b_;

@@ -94,6 +94,10 @@ Useful examples:
 - `--thread-policy perf|all`: constrain thread selection
 - `--mode standard|peak`: choose stable or peak-seeking behavior
 - `--backend cpu|metal|auto`: choose CPU-only, Metal GPU, or auto selection
+- `--output auto|tui|plain`: choose the output renderer; `auto` prefers the ANSI TUI
+- `--tui`: alias for `--output tui`
+- `--plain`: alias for `--output plain`
+- `--tui-style auto|unicode|ascii`: choose the TUI border/progress style
 - `--no-calibrate`: disable peak-mode calibration
 - `--no-qos`: disable macOS QoS hints
 - `--help`: print usage
@@ -103,6 +107,7 @@ Useful examples:
 - Default buffer size: `min(1 GiB, physical_memory / 8)`, with a floor of `256 MiB`
 - Default measured iterations: `7`
 - Default warmup iterations: `2`
+- Default output: `auto`, which uses the Unicode ANSI TUI on capable terminals and falls back to plain text for unsupported terminals or redirected output
 - Default Apple Silicon mode: `peak`
 - Default Apple Silicon backend: `auto` (CPU and Metal GPU compete)
 - Default Apple Silicon thread policy: `all`
