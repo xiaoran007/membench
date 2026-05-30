@@ -661,9 +661,10 @@ std::vector<KernelKind> buildKernelCandidates(const PlatformInfo& platform,
             break;
         case TestKind::Write:
             if (want_cpu) {
-                kernels.push_back(KernelKind::LibcMemset);
                 if (kernelSupported(platform, KernelKind::Avx2StreamStore)) {
                     kernels.push_back(KernelKind::Avx2StreamStore);
+                } else {
+                    kernels.push_back(KernelKind::LibcMemset);
                 }
                 if (platform.apple_silicon) {
                     kernels.push_back(KernelKind::NeonStore);
@@ -676,7 +677,7 @@ std::vector<KernelKind> buildKernelCandidates(const PlatformInfo& platform,
         case TestKind::Copy:
             if (want_cpu) {
                 kernels.push_back(KernelKind::LibcMemcpy);
-                if (kernelSupported(platform, KernelKind::Avx2StreamCopy)) {
+                if (!platform.x86_avx2 && kernelSupported(platform, KernelKind::Avx2StreamCopy)) {
                     kernels.push_back(KernelKind::Avx2StreamCopy);
                 }
                 if (platform.apple_silicon) {
