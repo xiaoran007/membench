@@ -54,19 +54,23 @@ struct MetalContext {
                 "    device const float4* src [[buffer(0)]],\n"
                 "    device atomic_uint* sink [[buffer(1)]],\n"
                 "    constant uint& count [[buffer(2)]],\n"
+                "    constant uint& total_threads [[buffer(3)]],\n"
                 "    uint tid [[thread_position_in_grid]],\n"
                 "    uint simd_lane [[thread_index_in_simdgroup]]) {\n"
-                "  uint base = tid * kEPT;\n"
-                "  if (base >= count) return;\n"
+                "  if (tid >= count) return;\n"
                 "  float4 a0 = float4(0.0), a1 = float4(0.0);\n"
                 "  float4 a2 = float4(0.0), a3 = float4(0.0);\n"
-                "  uint end = min(base + kEPT, count);\n"
-                "  uint i = base;\n"
-                "  for (; i + 4 <= end; i += 4) {\n"
-                "    a0 += src[i];   a1 += src[i+1];\n"
-                "    a2 += src[i+2]; a3 += src[i+3];\n"
+                "  for (uint step = 0; step < kEPT; step += 4) {\n"
+                "    uint i0 = tid + step * total_threads;\n"
+                "    if (i0 >= count) break;\n"
+                "    a0 += src[i0];\n"
+                "    uint i1 = i0 + total_threads;\n"
+                "    if (i1 < count) a1 += src[i1];\n"
+                "    uint i2 = i1 + total_threads;\n"
+                "    if (i2 < count) a2 += src[i2];\n"
+                "    uint i3 = i2 + total_threads;\n"
+                "    if (i3 < count) a3 += src[i3];\n"
                 "  }\n"
-                "  for (; i < end; ++i) a0 += src[i];\n"
                 "  float4 s = a0 + a1 + a2 + a3;\n"
                 "  uint h = as_type<uint>(s.x + s.y + s.z + s.w);\n"
                 "  h = simd_xor(h);\n"
@@ -79,36 +83,42 @@ struct MetalContext {
                 "    device float4* dst [[buffer(0)]],\n"
                 "    constant uint& count [[buffer(1)]],\n"
                 "    constant uint& pattern [[buffer(2)]],\n"
+                "    constant uint& total_threads [[buffer(3)]],\n"
                 "    uint tid [[thread_position_in_grid]]) {\n"
-                "  uint base = tid * kEPT;\n"
-                "  if (base >= count) return;\n"
+                "  if (tid >= count) return;\n"
                 "  float val = as_type<float>(pattern);\n"
                 "  float4 fill = float4(val);\n"
-                "  uint end = min(base + kEPT, count);\n"
-                "  uint i = base;\n"
-                "  for (; i + 4 <= end; i += 4) {\n"
-                "    dst[i] = fill; dst[i+1] = fill;\n"
-                "    dst[i+2] = fill; dst[i+3] = fill;\n"
+                "  for (uint step = 0; step < kEPT; step += 4) {\n"
+                "    uint i0 = tid + step * total_threads;\n"
+                "    if (i0 >= count) break;\n"
+                "    dst[i0] = fill;\n"
+                "    uint i1 = i0 + total_threads;\n"
+                "    if (i1 < count) dst[i1] = fill;\n"
+                "    uint i2 = i1 + total_threads;\n"
+                "    if (i2 < count) dst[i2] = fill;\n"
+                "    uint i3 = i2 + total_threads;\n"
+                "    if (i3 < count) dst[i3] = fill;\n"
                 "  }\n"
-                "  for (; i < end; ++i) dst[i] = fill;\n"
                 "}\n"
                 "\n"
                 "kernel void bw_copy(\n"
                 "    device const float4* src [[buffer(0)]],\n"
                 "    device float4* dst [[buffer(1)]],\n"
                 "    constant uint& count [[buffer(2)]],\n"
+                "    constant uint& total_threads [[buffer(3)]],\n"
                 "    uint tid [[thread_position_in_grid]]) {\n"
-                "  uint base = tid * kEPT;\n"
-                "  if (base >= count) return;\n"
-                "  uint end = min(base + kEPT, count);\n"
-                "  uint i = base;\n"
-                "  for (; i + 4 <= end; i += 4) {\n"
-                "    float4 v0 = src[i];   float4 v1 = src[i+1];\n"
-                "    float4 v2 = src[i+2]; float4 v3 = src[i+3];\n"
-                "    dst[i] = v0; dst[i+1] = v1;\n"
-                "    dst[i+2] = v2; dst[i+3] = v3;\n"
+                "  if (tid >= count) return;\n"
+                "  for (uint step = 0; step < kEPT; step += 4) {\n"
+                "    uint i0 = tid + step * total_threads;\n"
+                "    if (i0 >= count) break;\n"
+                "    dst[i0] = src[i0];\n"
+                "    uint i1 = i0 + total_threads;\n"
+                "    if (i1 < count) dst[i1] = src[i1];\n"
+                "    uint i2 = i1 + total_threads;\n"
+                "    if (i2 < count) dst[i2] = src[i2];\n"
+                "    uint i3 = i2 + total_threads;\n"
+                "    if (i3 < count) dst[i3] = src[i3];\n"
                 "  }\n"
-                "  for (; i < end; ++i) dst[i] = src[i];\n"
                 "}\n";
 
             MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
@@ -183,6 +193,9 @@ double runOnce(MetalTestKind kind,
                uint32_t pattern) {
     auto& c = ctx();
     id<MTLComputePipelineState> pso = pipelineForKind(kind);
+    const uint32_t totalThreads =
+        (float4Count + static_cast<uint32_t>(kElementsPerThread) - 1U) /
+        static_cast<uint32_t>(kElementsPerThread);
 
     @autoreleasepool {
         id<MTLCommandBuffer> cmdBuf = [c.queue commandBuffer];
@@ -195,20 +208,23 @@ double runOnce(MetalTestKind kind,
                 [enc setBuffer:bufA  offset:0 atIndex:0];
                 [enc setBuffer:sinkBuf offset:0 atIndex:1];
                 [enc setBytes:&float4Count length:sizeof(float4Count) atIndex:2];
+                [enc setBytes:&totalThreads length:sizeof(totalThreads) atIndex:3];
                 break;
             case MetalTestKind::Write:
                 [enc setBuffer:bufA  offset:0 atIndex:0];
                 [enc setBytes:&float4Count length:sizeof(float4Count) atIndex:1];
                 [enc setBytes:&pattern     length:sizeof(pattern)     atIndex:2];
+                [enc setBytes:&totalThreads length:sizeof(totalThreads) atIndex:3];
                 break;
             case MetalTestKind::Copy:
                 [enc setBuffer:bufA  offset:0 atIndex:0];
                 [enc setBuffer:bufB  offset:0 atIndex:1];
                 [enc setBytes:&float4Count length:sizeof(float4Count) atIndex:2];
+                [enc setBytes:&totalThreads length:sizeof(totalThreads) atIndex:3];
                 break;
         }
 
-        NSUInteger threadsNeeded = (float4Count + kElementsPerThread - 1) / kElementsPerThread;
+        NSUInteger threadsNeeded = totalThreads;
         NSUInteger threadgroupSize = std::min(pso.maxTotalThreadsPerThreadgroup,
                                               kPreferredThreadgroupSize);
         if (threadgroupSize > threadsNeeded) {
