@@ -21,6 +21,8 @@ set(MEMBENCH_SOURCES
     src/membench.cpp
     src/core/format.cpp
     src/core/statistics.cpp
+    src/memory/aligned_buffer.cpp
+    src/platform/platform.cpp
 )
 
 add_executable(membench ${MEMBENCH_SOURCES})
