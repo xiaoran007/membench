@@ -56,7 +56,7 @@ constexpr std::size_t kDefaultWarmupIterations = 2;
 constexpr std::size_t kDefaultMeasuredIterations = 7;
 constexpr std::size_t kCalibrationWarmupIterations = 1;
 constexpr std::size_t kCalibrationMeasuredIterations = 2;
-constexpr std::size_t kCalibrationPassesPerIteration = 2;
+constexpr std::size_t kCalibrationPassesPerIteration = 1;
 constexpr std::size_t kMinDefaultBufferSize = 256 * MB;
 constexpr std::size_t kMaxDefaultBufferSize = 1 * GB;
 constexpr std::size_t kCalibrationBufferSize = 1 * GB;
@@ -492,7 +492,11 @@ bool kernelSupported(const PlatformInfo& platform, KernelKind kernel) {
     return false;
 }
 
-double calibrationOverrideRatio(TestKind kind) {
+double calibrationOverrideRatio(const PlatformInfo& platform, TestKind kind) {
+    if (platform.x86_avx2) {
+        return 1.03;
+    }
+
     switch (kind) {
         case TestKind::Read:
             return 1.03;
@@ -1574,7 +1578,7 @@ private:
                       << total_candidates << " candidates)...\n";
         }
 
-        const double override_ratio = calibrationOverrideRatio(kind);
+        const double override_ratio = calibrationOverrideRatio(platform_, kind);
         for (KernelKind kernel : kernel_candidates) {
             if (!kernelSupported(platform_, kernel)) {
                 continue;
