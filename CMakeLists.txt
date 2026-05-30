@@ -58,8 +58,8 @@ if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
     # so no build-time Metal toolchain dependency is required.
     enable_language(OBJCXX)
 
-    target_sources(membench PRIVATE src/metal_backend.mm)
-    set_source_files_properties(src/metal_backend.mm PROPERTIES
+    target_sources(membench PRIVATE src/backends/metal_backend.mm)
+    set_source_files_properties(src/backends/metal_backend.mm PROPERTIES
         COMPILE_FLAGS "-fobjc-arc"
     )
     target_compile_definitions(membench PRIVATE MEMBENCH_HAS_METAL=1)

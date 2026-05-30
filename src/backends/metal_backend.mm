@@ -3,7 +3,7 @@
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
 
-#include "metal_backend.h"
+#include "backends/metal_backend.h"
 
 #include <cmath>
 #include <iostream>

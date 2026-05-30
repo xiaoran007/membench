@@ -25,7 +25,7 @@
 #endif
 
 #ifdef MEMBENCH_HAS_METAL
-#include "metal_backend.h"
+#include "backends/metal_backend.h"
 #endif
 
 namespace membench {
