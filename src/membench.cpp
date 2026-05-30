@@ -59,7 +59,7 @@ constexpr std::size_t kCacheLineSize = 64;
 constexpr std::size_t kDefaultWarmupIterations = 2;
 constexpr std::size_t kDefaultMeasuredIterations = 7;
 constexpr std::size_t kCalibrationWarmupIterations = 1;
-constexpr std::size_t kCalibrationMeasuredIterations = 2;
+constexpr std::size_t kCalibrationMeasuredIterations = 3;
 constexpr std::size_t kCalibrationPassesPerIteration = 1;
 constexpr std::size_t kMinDefaultBufferSize = 256 * MB;
 constexpr std::size_t kMaxDefaultBufferSize = 1 * GB;
@@ -1650,8 +1650,17 @@ private:
         }
 
         const std::size_t calibration_size = std::min(options_.size_bytes, kCalibrationBufferSize);
-        const std::vector<unsigned int> thread_candidates =
-            buildThreadCandidates(platform_, options_);
+        std::vector<unsigned int> thread_candidates = buildThreadCandidates(platform_, options_);
+        if (platform_.x86_avx2 && kind == TestKind::Write && options_.threads_override == 0) {
+            thread_candidates.erase(
+                std::remove_if(thread_candidates.begin(),
+                               thread_candidates.end(),
+                               [](unsigned int threads) { return threads > 4; }),
+                thread_candidates.end());
+            if (thread_candidates.empty()) {
+                thread_candidates.push_back(1);
+            }
+        }
         const std::vector<KernelKind> kernel_candidates =
             buildKernelCandidates(platform_, kind, options_.backend);
 
@@ -1790,6 +1799,9 @@ private:
         plan.kernel = chooseHeuristicKernel(platform_, options_, kind);
         if (options_.threads_override > 0) {
             plan.selected_threads = options_.threads_override;
+        } else if (options_.mode == RunMode::Peak && platform_.x86_avx2 &&
+                   kind == TestKind::Write) {
+            plan.selected_threads = std::min(4U, chooseDefaultThreadCount(platform_, ThreadPolicy::All));
         } else if (options_.mode == RunMode::Peak && platform_.apple_silicon) {
             if (kind == TestKind::Read) {
                 plan.selected_threads = chooseDefaultThreadCount(
