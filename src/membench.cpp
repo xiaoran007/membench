@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -26,8 +27,15 @@
 #include <windows.h>
 #else
 #include <pthread.h>
+#ifdef __linux__
+#include <sched.h>
+#endif
 #include <time.h>
 #include <unistd.h>
+#endif
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
 #endif
 
 #ifdef __APPLE__
@@ -51,11 +59,11 @@ constexpr std::size_t kCacheLineSize = 64;
 constexpr std::size_t kDefaultWarmupIterations = 2;
 constexpr std::size_t kDefaultMeasuredIterations = 7;
 constexpr std::size_t kCalibrationWarmupIterations = 1;
-constexpr std::size_t kCalibrationMeasuredIterations = 1;
-constexpr std::size_t kCalibrationPassesPerIteration = 2;
+constexpr std::size_t kCalibrationMeasuredIterations = 3;
+constexpr std::size_t kCalibrationPassesPerIteration = 1;
 constexpr std::size_t kMinDefaultBufferSize = 256 * MB;
 constexpr std::size_t kMaxDefaultBufferSize = 1 * GB;
-constexpr std::size_t kCalibrationBufferSize = 512 * MB;
+constexpr std::size_t kCalibrationBufferSize = 1 * GB;
 constexpr std::size_t kMaxBufferSize = 16 * GB;
 
 enum class TestKind {
@@ -87,6 +95,9 @@ enum class KernelKind {
     NeonStore,
     LibcMemcpy,
     NeonCopy,
+    Avx2Read,
+    Avx2StreamStore,
+    Avx2StreamCopy,
     MetalRead,
     MetalWrite,
     MetalCopy,
@@ -98,6 +109,8 @@ struct PlatformInfo {
     unsigned int hardware_threads = 1;
     unsigned int performance_cores = 0;
     bool apple_silicon = false;
+    bool x86_avx2 = false;
+    std::vector<unsigned int> cpu_affinity_order;
 };
 
 struct BenchmarkOptions {
@@ -201,6 +214,12 @@ std::string kernelToString(KernelKind kernel) {
             return "libc_memcpy";
         case KernelKind::NeonCopy:
             return "neon_copy";
+        case KernelKind::Avx2Read:
+            return "avx2_read";
+        case KernelKind::Avx2StreamStore:
+            return "avx2_stream_store";
+        case KernelKind::Avx2StreamCopy:
+            return "avx2_stream_copy";
         case KernelKind::MetalRead:
             return "metal_read";
         case KernelKind::MetalWrite:
@@ -365,6 +384,86 @@ std::uint64_t splitMix64(std::uint64_t value) {
     return value ^ (value >> 31U);
 }
 
+std::vector<unsigned int> parseCpuList(const std::string& text) {
+    std::vector<unsigned int> cpus;
+    std::stringstream stream(text);
+    std::string item;
+    while (std::getline(stream, item, ',')) {
+        const auto dash = item.find('-');
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        if (dash == std::string::npos) {
+            if (!parseUnsigned64(item, &begin)) {
+                continue;
+            }
+            end = begin;
+        } else {
+            if (!parseUnsigned64(item.substr(0, dash), &begin) ||
+                !parseUnsigned64(item.substr(dash + 1), &end) || end < begin) {
+                continue;
+            }
+        }
+        for (std::uint64_t cpu = begin; cpu <= end; ++cpu) {
+            if (cpu <= std::numeric_limits<unsigned int>::max()) {
+                cpus.push_back(static_cast<unsigned int>(cpu));
+            }
+        }
+    }
+    return cpus;
+}
+
+bool containsCpu(const std::vector<unsigned int>& cpus, unsigned int cpu) {
+    return std::find(cpus.begin(), cpus.end(), cpu) != cpus.end();
+}
+
+#ifdef __linux__
+std::vector<unsigned int> readThreadSiblings(unsigned int cpu) {
+    const std::string path = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
+                             "/topology/thread_siblings_list";
+    std::ifstream file(path);
+    std::string line;
+    if (!std::getline(file, line)) {
+        return {cpu};
+    }
+    return parseCpuList(line);
+}
+
+std::vector<unsigned int> detectPhysicalFirstCpuOrder() {
+    cpu_set_t allowed_set;
+    CPU_ZERO(&allowed_set);
+    if (sched_getaffinity(0, sizeof(allowed_set), &allowed_set) != 0) {
+        return {};
+    }
+
+    std::vector<unsigned int> allowed;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (CPU_ISSET(cpu, &allowed_set)) {
+            allowed.push_back(static_cast<unsigned int>(cpu));
+        }
+    }
+
+    std::vector<unsigned int> primary;
+    std::vector<unsigned int> secondary;
+    for (unsigned int cpu : allowed) {
+        const std::vector<unsigned int> siblings = readThreadSiblings(cpu);
+        unsigned int first_allowed_sibling = cpu;
+        for (unsigned int sibling : siblings) {
+            if (containsCpu(allowed, sibling)) {
+                first_allowed_sibling = std::min(first_allowed_sibling, sibling);
+            }
+        }
+        if (cpu == first_allowed_sibling) {
+            primary.push_back(cpu);
+        } else {
+            secondary.push_back(cpu);
+        }
+    }
+
+    primary.insert(primary.end(), secondary.begin(), secondary.end());
+    return primary;
+}
+#endif
+
 PlatformInfo detectPlatformInfo() {
     PlatformInfo info;
 #ifdef _WIN32
@@ -409,7 +508,18 @@ PlatformInfo detectPlatformInfo() {
         info.physical_memory_bytes =
             static_cast<std::uint64_t>(phys_pages) * static_cast<std::uint64_t>(page_size);
     }
+
+#if defined(__x86_64__) || defined(__i386__)
+#if (defined(__GNUC__) || defined(__clang__)) && defined(__AVX2__)
+    __builtin_cpu_init();
+    info.x86_avx2 = __builtin_cpu_supports("avx2");
 #endif
+#endif
+#endif
+#endif
+
+#ifdef __linux__
+    info.cpu_affinity_order = detectPhysicalFirstCpuOrder();
 #endif
 
     if (info.physical_memory_bytes == 0) {
@@ -436,7 +546,7 @@ unsigned int chooseDefaultThreadCount(const PlatformInfo& platform, ThreadPolicy
 }
 
 RunMode chooseDefaultMode(const PlatformInfo& platform) {
-    return platform.apple_silicon ? RunMode::Peak : RunMode::Standard;
+    return (platform.apple_silicon || platform.x86_avx2) ? RunMode::Peak : RunMode::Standard;
 }
 
 bool kernelSupported(const PlatformInfo& platform, KernelKind kernel) {
@@ -445,6 +555,15 @@ bool kernelSupported(const PlatformInfo& platform, KernelKind kernel) {
         case KernelKind::LibcMemset:
         case KernelKind::LibcMemcpy:
             return true;
+        case KernelKind::Avx2Read:
+        case KernelKind::Avx2StreamStore:
+        case KernelKind::Avx2StreamCopy:
+#if defined(__AVX2__)
+            return platform.x86_avx2;
+#else
+            (void)platform;
+            return false;
+#endif
         case KernelKind::NeonPeak:
         case KernelKind::NeonStore:
         case KernelKind::NeonCopy:
@@ -462,7 +581,11 @@ bool kernelSupported(const PlatformInfo& platform, KernelKind kernel) {
     return false;
 }
 
-double calibrationOverrideRatio(TestKind kind) {
+double calibrationOverrideRatio(const PlatformInfo& platform, TestKind kind) {
+    if (platform.x86_avx2) {
+        return 1.03;
+    }
+
     switch (kind) {
         case TestKind::Read:
             return 1.03;
@@ -498,6 +621,12 @@ std::vector<unsigned int> buildThreadCandidates(const PlatformInfo& platform,
             candidates.push_back(perf_threads);
             candidates.push_back(all_threads);
         }
+    } else if (options.mode == RunMode::Peak && platform.x86_avx2) {
+        for (unsigned int value = 1; value < all_threads; value *= 2) {
+            candidates.push_back(value);
+        }
+        candidates.push_back(std::max(1U, all_threads / 2U));
+        candidates.push_back(all_threads);
     } else {
         candidates.push_back(chooseDefaultThreadCount(platform, options.thread_policy));
     }
@@ -532,7 +661,11 @@ std::vector<KernelKind> buildKernelCandidates(const PlatformInfo& platform,
             break;
         case TestKind::Write:
             if (want_cpu) {
-                kernels.push_back(KernelKind::LibcMemset);
+                if (kernelSupported(platform, KernelKind::Avx2StreamStore)) {
+                    kernels.push_back(KernelKind::Avx2StreamStore);
+                } else {
+                    kernels.push_back(KernelKind::LibcMemset);
+                }
                 if (platform.apple_silicon) {
                     kernels.push_back(KernelKind::NeonStore);
                 }
@@ -544,6 +677,9 @@ std::vector<KernelKind> buildKernelCandidates(const PlatformInfo& platform,
         case TestKind::Copy:
             if (want_cpu) {
                 kernels.push_back(KernelKind::LibcMemcpy);
+                if (!platform.x86_avx2 && kernelSupported(platform, KernelKind::Avx2StreamCopy)) {
+                    kernels.push_back(KernelKind::Avx2StreamCopy);
+                }
                 if (platform.apple_silicon) {
                     kernels.push_back(KernelKind::NeonCopy);
                 }
@@ -575,6 +711,10 @@ KernelKind chooseHeuristicKernel(const PlatformInfo& platform,
         case TestKind::Read:
             return KernelKind::ScalarAuto;
         case TestKind::Write:
+            if (options.mode == RunMode::Peak &&
+                kernelSupported(platform, KernelKind::Avx2StreamStore)) {
+                return KernelKind::Avx2StreamStore;
+            }
             return KernelKind::LibcMemset;
         case TestKind::Copy:
             return KernelKind::LibcMemcpy;
@@ -637,6 +777,13 @@ void printSystemInfo(const PlatformInfo& platform) {
             std::cout << "Metal GPU: unavailable\n";
         }
 #endif
+    }
+    if (platform.x86_avx2) {
+        std::cout << "x86 AVX2: available\n";
+    }
+    if (!platform.cpu_affinity_order.empty()) {
+        std::cout << "CPU affinity order: " << platform.cpu_affinity_order.size()
+                  << " logical CPUs, physical cores first\n";
     }
     std::cout << '\n';
 }
@@ -757,7 +904,8 @@ public:
           buffer_a_(buffer_a),
           buffer_b_(buffer_b),
           size_bytes_(size_bytes),
-          thread_count_(resolveThreadCount(requested_threads)) {
+          thread_count_(resolveThreadCount(requested_threads)),
+          cpu_affinity_order_(platform.cpu_affinity_order) {
         buildSlices();
         startWorkers();
     }
@@ -906,7 +1054,22 @@ private:
 #endif
     }
 
+    void maybeApplyThreadAffinity(unsigned int worker_index) const {
+#ifdef __linux__
+        if (worker_index >= cpu_affinity_order_.size()) {
+            return;
+        }
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(cpu_affinity_order_[worker_index], &cpuset);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+#else
+        (void)worker_index;
+#endif
+    }
+
     void workerLoop(unsigned int worker_index, const Slice& slice) {
+        maybeApplyThreadAffinity(worker_index);
         maybeApplyThreadPolicy();
 
         std::size_t observed_command_generation = 0;
@@ -954,21 +1117,27 @@ private:
     void executeCommand(const WorkerCommand& command, const Slice& slice, unsigned int worker_index) {
         switch (command.kind) {
             case TestKind::Read:
-                if (command.kernel == KernelKind::NeonPeak && kernelSupported(platform_, command.kernel)) {
+                if (command.kernel == KernelKind::Avx2Read && kernelSupported(platform_, command.kernel)) {
+                    runReadAvx2(slice, command.passes, worker_index);
+                } else if (command.kernel == KernelKind::NeonPeak && kernelSupported(platform_, command.kernel)) {
                     runReadNeonPeak(slice, command.passes, worker_index);
                 } else {
                     runReadScalar(slice, command.passes, worker_index);
                 }
                 break;
             case TestKind::Write:
-                if (command.kernel == KernelKind::NeonStore && kernelSupported(platform_, command.kernel)) {
+                if (command.kernel == KernelKind::Avx2StreamStore && kernelSupported(platform_, command.kernel)) {
+                    runWriteAvx2Stream(slice, command.passes, command.write_pattern);
+                } else if (command.kernel == KernelKind::NeonStore && kernelSupported(platform_, command.kernel)) {
                     runWriteNeonStore(slice, command.passes, command.write_pattern);
                 } else {
                     runWriteMemset(slice, command.passes, command.write_pattern);
                 }
                 break;
             case TestKind::Copy:
-                if (command.kernel == KernelKind::NeonCopy && kernelSupported(platform_, command.kernel)) {
+                if (command.kernel == KernelKind::Avx2StreamCopy && kernelSupported(platform_, command.kernel)) {
+                    runCopyAvx2Stream(slice, command.passes);
+                } else if (command.kernel == KernelKind::NeonCopy && kernelSupported(platform_, command.kernel)) {
                     runCopyNeon(slice, command.passes);
                 } else {
                     runCopyMemcpy(slice, command.passes);
@@ -1010,6 +1179,65 @@ private:
             accumulator0 ^ accumulator1 ^ accumulator2 ^ accumulator3 ^ tail;
         sink_.fetch_xor(local_sink, std::memory_order_relaxed);
         doNotOptimize(local_sink);
+    }
+
+    void runReadAvx2(const Slice& slice, std::size_t passes, unsigned int worker_index) {
+#if defined(__AVX2__)
+        const auto* bytes = buffer_a_ + slice.offset;
+        __m256i acc0 = _mm256_set1_epi64x(static_cast<long long>(splitMix64(worker_index + 1U)));
+        __m256i acc1 = _mm256_set1_epi64x(static_cast<long long>(splitMix64(worker_index + 11U)));
+        __m256i acc2 = _mm256_set1_epi64x(static_cast<long long>(splitMix64(worker_index + 21U)));
+        __m256i acc3 = _mm256_set1_epi64x(static_cast<long long>(splitMix64(worker_index + 31U)));
+        __m256i acc4 = _mm256_set1_epi64x(static_cast<long long>(splitMix64(worker_index + 41U)));
+        __m256i acc5 = _mm256_set1_epi64x(static_cast<long long>(splitMix64(worker_index + 51U)));
+        __m256i acc6 = _mm256_set1_epi64x(static_cast<long long>(splitMix64(worker_index + 61U)));
+        __m256i acc7 = _mm256_set1_epi64x(static_cast<long long>(splitMix64(worker_index + 71U)));
+
+        std::size_t index = 0;
+        for (std::size_t pass = 0; pass < passes; ++pass) {
+            index = 0;
+            for (; index + 256 <= slice.size; index += 256) {
+                _mm_prefetch(reinterpret_cast<const char*>(bytes + index + 1024), _MM_HINT_NTA);
+                acc0 = _mm256_add_epi64(
+                    acc0, _mm256_load_si256(reinterpret_cast<const __m256i*>(bytes + index + 0)));
+                acc1 = _mm256_add_epi64(
+                    acc1, _mm256_load_si256(reinterpret_cast<const __m256i*>(bytes + index + 32)));
+                acc2 = _mm256_add_epi64(
+                    acc2, _mm256_load_si256(reinterpret_cast<const __m256i*>(bytes + index + 64)));
+                acc3 = _mm256_add_epi64(
+                    acc3, _mm256_load_si256(reinterpret_cast<const __m256i*>(bytes + index + 96)));
+                acc4 = _mm256_add_epi64(
+                    acc4, _mm256_load_si256(reinterpret_cast<const __m256i*>(bytes + index + 128)));
+                acc5 = _mm256_add_epi64(
+                    acc5, _mm256_load_si256(reinterpret_cast<const __m256i*>(bytes + index + 160)));
+                acc6 = _mm256_add_epi64(
+                    acc6, _mm256_load_si256(reinterpret_cast<const __m256i*>(bytes + index + 192)));
+                acc7 = _mm256_add_epi64(
+                    acc7, _mm256_load_si256(reinterpret_cast<const __m256i*>(bytes + index + 224)));
+            }
+        }
+
+        std::uint64_t tail = 0;
+        for (; index < slice.size; ++index) {
+            tail += bytes[index];
+        }
+
+        acc0 = _mm256_xor_si256(acc0, acc1);
+        acc2 = _mm256_xor_si256(acc2, acc3);
+        acc4 = _mm256_xor_si256(acc4, acc5);
+        acc6 = _mm256_xor_si256(acc6, acc7);
+        acc0 = _mm256_xor_si256(acc0, acc2);
+        acc4 = _mm256_xor_si256(acc4, acc6);
+        acc0 = _mm256_xor_si256(acc0, acc4);
+
+        alignas(32) std::uint64_t lanes[4];
+        _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), acc0);
+        const std::uint64_t local_sink = lanes[0] ^ lanes[1] ^ lanes[2] ^ lanes[3] ^ tail;
+        sink_.fetch_xor(local_sink, std::memory_order_relaxed);
+        doNotOptimize(local_sink);
+#else
+        runReadScalar(slice, passes, worker_index);
+#endif
     }
 
     void runReadNeonPeak(const Slice& slice, std::size_t passes, unsigned int worker_index) {
@@ -1077,6 +1305,44 @@ private:
         doNotOptimize(local_sink);
     }
 
+    void runWriteAvx2Stream(const Slice& slice,
+                            std::size_t passes,
+                            std::uint8_t base_pattern) {
+#if defined(__AVX2__)
+        auto* bytes = buffer_a_ + slice.offset;
+        std::uint8_t pattern = base_pattern;
+
+        for (std::size_t pass = 0; pass < passes; ++pass) {
+            const __m256i fill = _mm256_set1_epi8(static_cast<char>(pattern));
+            std::size_t index = 0;
+            for (; index + 256 <= slice.size; index += 256) {
+                auto* ptr = reinterpret_cast<__m256i*>(bytes + index);
+                _mm256_stream_si256(ptr + 0, fill);
+                _mm256_stream_si256(ptr + 1, fill);
+                _mm256_stream_si256(ptr + 2, fill);
+                _mm256_stream_si256(ptr + 3, fill);
+                _mm256_stream_si256(ptr + 4, fill);
+                _mm256_stream_si256(ptr + 5, fill);
+                _mm256_stream_si256(ptr + 6, fill);
+                _mm256_stream_si256(ptr + 7, fill);
+            }
+            if (index < slice.size) {
+                std::memset(bytes + index, pattern, slice.size - index);
+            }
+            _mm_sfence();
+            pattern = togglePattern(pattern);
+        }
+
+        const std::uint64_t local_sink =
+            static_cast<std::uint64_t>(bytes[0]) ^
+            (static_cast<std::uint64_t>(bytes[slice.size - 1]) << 8U);
+        sink_.fetch_xor(local_sink, std::memory_order_relaxed);
+        doNotOptimize(local_sink);
+#else
+        runWriteMemset(slice, passes, base_pattern);
+#endif
+    }
+
     void runWriteNeonStore(const Slice& slice, std::size_t passes, std::uint8_t base_pattern) {
 #if defined(__aarch64__) || defined(__arm64__) || defined(__ARM_NEON)
         auto* bytes = buffer_a_ + slice.offset;
@@ -1124,6 +1390,64 @@ private:
             (static_cast<std::uint64_t>(b[slice.size - 1]) << 8U);
         sink_.fetch_xor(local_sink, std::memory_order_relaxed);
         doNotOptimize(local_sink);
+    }
+
+    void runCopyAvx2Stream(const Slice& slice, std::size_t passes) {
+#if defined(__AVX2__)
+        auto copy_once = [&](std::uint8_t* dst, const std::uint8_t* src) {
+            std::size_t index = 0;
+            for (; index + 256 <= slice.size; index += 256) {
+                _mm_prefetch(reinterpret_cast<const char*>(src + index + 1024), _MM_HINT_NTA);
+                const __m256i v0 =
+                    _mm256_load_si256(reinterpret_cast<const __m256i*>(src + index + 0));
+                const __m256i v1 =
+                    _mm256_load_si256(reinterpret_cast<const __m256i*>(src + index + 32));
+                const __m256i v2 =
+                    _mm256_load_si256(reinterpret_cast<const __m256i*>(src + index + 64));
+                const __m256i v3 =
+                    _mm256_load_si256(reinterpret_cast<const __m256i*>(src + index + 96));
+                const __m256i v4 =
+                    _mm256_load_si256(reinterpret_cast<const __m256i*>(src + index + 128));
+                const __m256i v5 =
+                    _mm256_load_si256(reinterpret_cast<const __m256i*>(src + index + 160));
+                const __m256i v6 =
+                    _mm256_load_si256(reinterpret_cast<const __m256i*>(src + index + 192));
+                const __m256i v7 =
+                    _mm256_load_si256(reinterpret_cast<const __m256i*>(src + index + 224));
+                auto* ptr = reinterpret_cast<__m256i*>(dst + index);
+                _mm256_stream_si256(ptr + 0, v0);
+                _mm256_stream_si256(ptr + 1, v1);
+                _mm256_stream_si256(ptr + 2, v2);
+                _mm256_stream_si256(ptr + 3, v3);
+                _mm256_stream_si256(ptr + 4, v4);
+                _mm256_stream_si256(ptr + 5, v5);
+                _mm256_stream_si256(ptr + 6, v6);
+                _mm256_stream_si256(ptr + 7, v7);
+            }
+            if (index < slice.size) {
+                std::memcpy(dst + index, src + index, slice.size - index);
+            }
+            _mm_sfence();
+        };
+
+        auto* a = buffer_a_ + slice.offset;
+        auto* b = buffer_b_ + slice.offset;
+        for (std::size_t pass = 0; pass < passes; ++pass) {
+            if ((pass % 2U) == 0U) {
+                copy_once(b, a);
+            } else {
+                copy_once(a, b);
+            }
+        }
+
+        const std::uint64_t local_sink =
+            static_cast<std::uint64_t>(a[0]) ^
+            (static_cast<std::uint64_t>(b[slice.size - 1]) << 8U);
+        sink_.fetch_xor(local_sink, std::memory_order_relaxed);
+        doNotOptimize(local_sink);
+#else
+        runCopyMemcpy(slice, passes);
+#endif
     }
 
     void runCopyNeon(const Slice& slice, std::size_t passes) {
@@ -1193,6 +1517,7 @@ private:
     std::uint8_t* buffer_b_ = nullptr;
     std::size_t size_bytes_ = 0;
     unsigned int thread_count_ = 1;
+    std::vector<unsigned int> cpu_affinity_order_;
     std::vector<Slice> slices_;
     std::vector<std::thread> workers_;
 
@@ -1235,6 +1560,9 @@ public:
         if (options_.threads_override > 0) {
             std::cout << "Thread override: " << options_.threads_override << '\n';
         }
+        std::cout << "Worker affinity: "
+                  << (!platform_.cpu_affinity_order.empty() ? "physical-first" : "disabled")
+                  << '\n';
         std::cout << "macOS QoS hint: " << (options_.use_qos ? "enabled" : "disabled") << '\n';
         std::cout << "Tests: ";
         for (std::size_t index = 0; index < options_.tests.size(); ++index) {
@@ -1287,7 +1615,8 @@ public:
 
 private:
     bool isCalibrationEnabled() const {
-        return options_.mode == RunMode::Peak && options_.calibrate && platform_.apple_silicon;
+        return options_.mode == RunMode::Peak && options_.calibrate &&
+               (platform_.apple_silicon || platform_.x86_avx2);
     }
 
     void initializeBuffers() {
@@ -1316,10 +1645,22 @@ private:
         if (!isCalibrationEnabled()) {
             return buildHeuristicPlan(kind);
         }
+        if (platform_.x86_avx2 && kind == TestKind::Read) {
+            return buildHeuristicPlan(kind);
+        }
 
         const std::size_t calibration_size = std::min(options_.size_bytes, kCalibrationBufferSize);
-        const std::vector<unsigned int> thread_candidates =
-            buildThreadCandidates(platform_, options_);
+        std::vector<unsigned int> thread_candidates = buildThreadCandidates(platform_, options_);
+        if (platform_.x86_avx2 && kind == TestKind::Write && options_.threads_override == 0) {
+            thread_candidates.erase(
+                std::remove_if(thread_candidates.begin(),
+                               thread_candidates.end(),
+                               [](unsigned int threads) { return threads > 4; }),
+                thread_candidates.end());
+            if (thread_candidates.empty()) {
+                thread_candidates.push_back(1);
+            }
+        }
         const std::vector<KernelKind> kernel_candidates =
             buildKernelCandidates(platform_, kind, options_.backend);
 
@@ -1343,10 +1684,24 @@ private:
             best_candidate.kernel = heuristic_plan.kernel;
             best_candidate.requested_threads = heuristic_plan.selected_threads;
             best_candidate.actual_threads = heuristic_runner.threadCount();
-            best_candidate.score_mb_per_sec = heuristic_result.bandwidth_mb_per_sec.average;
+            best_candidate.score_mb_per_sec = heuristic_result.bandwidth_mb_per_sec.median;
         }
 
-        const double override_ratio = calibrationOverrideRatio(kind);
+        std::size_t total_candidates = 0;
+        for (KernelKind kernel : kernel_candidates) {
+            if (!kernelSupported(platform_, kernel)) {
+                continue;
+            }
+            total_candidates += isMetalKernel(kernel) ? 1 : thread_candidates.size();
+        }
+
+        std::size_t completed_candidates = 0;
+        if (total_candidates > 0) {
+            std::cout << "Calibrating " << testKindToTitle(kind) << " ("
+                      << total_candidates << " candidates)...\n";
+        }
+
+        const double override_ratio = calibrationOverrideRatio(platform_, kind);
         for (KernelKind kernel : kernel_candidates) {
             if (!kernelSupported(platform_, kernel)) {
                 continue;
@@ -1354,6 +1709,9 @@ private:
 
             if (isMetalKernel(kernel)) {
 #ifdef MEMBENCH_HAS_METAL
+                ++completed_candidates;
+                std::cout << "\r  candidate " << completed_candidates << '/'
+                          << total_candidates << ": " << kernelToString(kernel) << std::flush;
                 MetalTestKind mk = metalTestKindFor(kind);
                 MetalIterationResult mr = metalRunBandwidthTest(
                     mk, calibration_size,
@@ -1361,8 +1719,7 @@ private:
                     kCalibrationMeasuredIterations);
                 double score = 0.0;
                 if (!mr.bandwidth_samples.empty()) {
-                    for (double s : mr.bandwidth_samples) score += s;
-                    score /= static_cast<double>(mr.bandwidth_samples.size());
+                    score = calculateStatistics(mr.bandwidth_samples).median;
                 }
                 if (score > best_candidate.score_mb_per_sec * override_ratio) {
                     best_candidate.kernel = kernel;
@@ -1382,12 +1739,16 @@ private:
                                        buffer_b_.data(),
                                        calibration_size,
                                        requested_threads);
+                ++completed_candidates;
+                std::cout << "\r  candidate " << completed_candidates << '/'
+                          << total_candidates << ": " << kernelToString(kernel)
+                          << ", " << runner.threadCount() << " threads" << std::flush;
                 const TestResult result = runner.run(kind,
                                                      kernel,
                                                      kCalibrationWarmupIterations,
                                                      kCalibrationMeasuredIterations,
                                                      kCalibrationPassesPerIteration);
-                const double score = result.bandwidth_mb_per_sec.average;
+                const double score = result.bandwidth_mb_per_sec.median;
                 if (kernel == best_candidate.kernel &&
                     runner.threadCount() == best_candidate.actual_threads) {
                     continue;
@@ -1399,6 +1760,15 @@ private:
                     best_candidate.score_mb_per_sec = score;
                 }
             }
+        }
+        if (total_candidates > 0) {
+            std::cout << "\r  selected " << kernelToString(best_candidate.kernel);
+            if (!isMetalKernel(best_candidate.kernel)) {
+                std::cout << ", " << best_candidate.actual_threads << " threads";
+            }
+            std::cout << " at " << std::fixed << std::setprecision(2)
+                      << (best_candidate.score_mb_per_sec / 1024.0) << " GB/s"
+                      << "                      \n";
         }
 
         ExecutionPlan plan;
@@ -1429,6 +1799,9 @@ private:
         plan.kernel = chooseHeuristicKernel(platform_, options_, kind);
         if (options_.threads_override > 0) {
             plan.selected_threads = options_.threads_override;
+        } else if (options_.mode == RunMode::Peak && platform_.x86_avx2 &&
+                   kind == TestKind::Write) {
+            plan.selected_threads = std::min(4U, chooseDefaultThreadCount(platform_, ThreadPolicy::All));
         } else if (options_.mode == RunMode::Peak && platform_.apple_silicon) {
             if (kind == TestKind::Read) {
                 plan.selected_threads = chooseDefaultThreadCount(
@@ -1595,7 +1968,7 @@ int main(int argc, char* argv[]) {
     options.measured_iterations = kDefaultMeasuredIterations;
     options.mode = chooseDefaultMode(platform);
     options.thread_policy = platform.apple_silicon ? ThreadPolicy::All : ThreadPolicy::All;
-    options.calibrate = platform.apple_silicon;
+    options.calibrate = platform.apple_silicon || platform.x86_avx2;
     options.use_qos = platform.apple_silicon;
 #ifdef MEMBENCH_HAS_METAL
     options.backend = platform.apple_silicon ? Backend::Auto : Backend::Cpu;
@@ -1718,7 +2091,7 @@ int main(int argc, char* argv[]) {
             if (!platform.apple_silicon) {
                 options.calibrate = false;
             }
-        } else if (!platform.apple_silicon) {
+        } else if (!platform.apple_silicon && !platform.x86_avx2) {
             options.calibrate = false;
         }
     } catch (const std::exception& ex) {
