@@ -13,8 +13,8 @@ constexpr std::size_t GB = 1024 * MB;
 constexpr std::size_t kCacheLineSize = 64;
 constexpr std::size_t kDefaultWarmupIterations = 2;
 constexpr std::size_t kDefaultMeasuredIterations = 7;
-constexpr std::size_t kCalibrationWarmupIterations = 1;
-constexpr std::size_t kCalibrationMeasuredIterations = 3;
+constexpr std::size_t kCalibrationWarmupIterations = 2;
+constexpr std::size_t kCalibrationMeasuredIterations = 5;
 constexpr std::size_t kCalibrationPassesPerIteration = 1;
 constexpr std::size_t kMinDefaultBufferSize = 256 * MB;
 constexpr std::size_t kMaxDefaultBufferSize = 1 * GB;
@@ -53,6 +53,9 @@ enum class KernelKind {
     Avx2Read,
     Avx2StreamStore,
     Avx2StreamCopy,
+    IspcRead,
+    IspcWrite,
+    IspcCopy,
     MetalRead,
     MetalWrite,
     MetalCopy,
@@ -78,6 +81,8 @@ struct BenchmarkOptions {
     Backend backend = Backend::Cpu;
     bool calibrate = false;
     bool use_qos = false;
+    bool kernel_override_enabled = false;
+    KernelKind kernel_override = KernelKind::ScalarAuto;
     std::vector<TestKind> tests;
 };
 

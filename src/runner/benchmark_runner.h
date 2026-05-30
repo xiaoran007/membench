@@ -29,6 +29,10 @@
 #include <arm_neon.h>
 #endif
 
+#ifdef MEMBENCH_HAS_ISPC
+#include "membench_ispc.h"
+#endif
+
 namespace membench {
 
 template <typename T>
@@ -44,6 +48,16 @@ inline void doNotOptimize(const T& value) {
     (void)value;
 #endif
 }
+
+#ifdef MEMBENCH_HAS_ISPC
+inline void storeFence() {
+#if defined(__x86_64__) || defined(__i386__)
+    _mm_sfence();
+#else
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
+}
+#endif
 
 class BenchmarkRunner {
 public:
@@ -254,7 +268,9 @@ private:
     void executeCommand(const WorkerCommand& command, const Slice& slice, unsigned int worker_index) {
         switch (command.kind) {
             case TestKind::Read:
-                if (command.kernel == KernelKind::Avx2Read && kernelSupported(platform_, command.kernel)) {
+                if (command.kernel == KernelKind::IspcRead && kernelSupported(platform_, command.kernel)) {
+                    runReadIspc(slice, command.passes, worker_index);
+                } else if (command.kernel == KernelKind::Avx2Read && kernelSupported(platform_, command.kernel)) {
                     runReadAvx2(slice, command.passes, worker_index);
                 } else if (command.kernel == KernelKind::NeonPeak && kernelSupported(platform_, command.kernel)) {
                     runReadNeonPeak(slice, command.passes, worker_index);
@@ -263,7 +279,9 @@ private:
                 }
                 break;
             case TestKind::Write:
-                if (command.kernel == KernelKind::Avx2StreamStore && kernelSupported(platform_, command.kernel)) {
+                if (command.kernel == KernelKind::IspcWrite && kernelSupported(platform_, command.kernel)) {
+                    runWriteIspc(slice, command.passes, command.write_pattern);
+                } else if (command.kernel == KernelKind::Avx2StreamStore && kernelSupported(platform_, command.kernel)) {
                     runWriteAvx2Stream(slice, command.passes, command.write_pattern);
                 } else if (command.kernel == KernelKind::NeonStore && kernelSupported(platform_, command.kernel)) {
                     runWriteNeonStore(slice, command.passes, command.write_pattern);
@@ -272,7 +290,9 @@ private:
                 }
                 break;
             case TestKind::Copy:
-                if (command.kernel == KernelKind::Avx2StreamCopy && kernelSupported(platform_, command.kernel)) {
+                if (command.kernel == KernelKind::IspcCopy && kernelSupported(platform_, command.kernel)) {
+                    runCopyIspc(slice, command.passes);
+                } else if (command.kernel == KernelKind::Avx2StreamCopy && kernelSupported(platform_, command.kernel)) {
                     runCopyAvx2Stream(slice, command.passes);
                 } else if (command.kernel == KernelKind::NeonCopy && kernelSupported(platform_, command.kernel)) {
                     runCopyNeon(slice, command.passes);
@@ -316,6 +336,29 @@ private:
             accumulator0 ^ accumulator1 ^ accumulator2 ^ accumulator3 ^ tail;
         sink_.fetch_xor(local_sink, std::memory_order_relaxed);
         doNotOptimize(local_sink);
+    }
+
+    void runReadIspc(const Slice& slice, std::size_t passes, unsigned int worker_index) {
+#ifdef MEMBENCH_HAS_ISPC
+        const auto* bytes = buffer_a_ + slice.offset;
+        const auto* words = reinterpret_cast<const std::uint64_t*>(bytes);
+        const std::size_t word_count = slice.size / sizeof(std::uint64_t);
+        const std::size_t tail_offset = word_count * sizeof(std::uint64_t);
+        const std::size_t tail_size = slice.size - tail_offset;
+        const auto* tail = tail_size > 0 ? bytes + tail_offset : bytes;
+        const std::uint64_t seed = splitMix64(worker_index + 1U);
+        const std::uint64_t local_sink =
+            ispc::membench_ispc_read(const_cast<std::uint64_t*>(words),
+                                     static_cast<std::int64_t>(word_count),
+                                     const_cast<std::uint8_t*>(tail),
+                                     static_cast<std::int64_t>(tail_size),
+                                     static_cast<std::int32_t>(passes),
+                                     seed);
+        sink_.fetch_xor(local_sink, std::memory_order_relaxed);
+        doNotOptimize(local_sink);
+#else
+        runReadScalar(slice, passes, worker_index);
+#endif
     }
 
     void runReadAvx2(const Slice& slice, std::size_t passes, unsigned int worker_index) {
@@ -442,6 +485,32 @@ private:
         doNotOptimize(local_sink);
     }
 
+    void runWriteIspc(const Slice& slice, std::size_t passes, std::uint8_t base_pattern) {
+#ifdef MEMBENCH_HAS_ISPC
+        auto* bytes = buffer_a_ + slice.offset;
+        auto* words = reinterpret_cast<std::uint64_t*>(bytes);
+        const std::size_t word_count = slice.size / sizeof(std::uint64_t);
+        const std::size_t tail_offset = word_count * sizeof(std::uint64_t);
+        const std::size_t tail_size = slice.size - tail_offset;
+        auto* tail = tail_size > 0 ? bytes + tail_offset : bytes;
+        ispc::membench_ispc_write(words,
+                                  static_cast<std::int64_t>(word_count),
+                                  tail,
+                                  static_cast<std::int64_t>(tail_size),
+                                  static_cast<std::int32_t>(passes),
+                                  base_pattern);
+        storeFence();
+
+        const std::uint64_t local_sink =
+            static_cast<std::uint64_t>(bytes[0]) ^
+            (static_cast<std::uint64_t>(bytes[slice.size - 1]) << 8U);
+        sink_.fetch_xor(local_sink, std::memory_order_relaxed);
+        doNotOptimize(local_sink);
+#else
+        runWriteMemset(slice, passes, base_pattern);
+#endif
+    }
+
     void runWriteAvx2Stream(const Slice& slice,
                             std::size_t passes,
                             std::uint8_t base_pattern) {
@@ -527,6 +596,36 @@ private:
             (static_cast<std::uint64_t>(b[slice.size - 1]) << 8U);
         sink_.fetch_xor(local_sink, std::memory_order_relaxed);
         doNotOptimize(local_sink);
+    }
+
+    void runCopyIspc(const Slice& slice, std::size_t passes) {
+#ifdef MEMBENCH_HAS_ISPC
+        auto* a = buffer_a_ + slice.offset;
+        auto* b = buffer_b_ + slice.offset;
+        auto* a_words = reinterpret_cast<std::uint64_t*>(a);
+        auto* b_words = reinterpret_cast<std::uint64_t*>(b);
+        const std::size_t word_count = slice.size / sizeof(std::uint64_t);
+        const std::size_t tail_offset = word_count * sizeof(std::uint64_t);
+        const std::size_t tail_size = slice.size - tail_offset;
+        auto* a_tail = tail_size > 0 ? a + tail_offset : a;
+        auto* b_tail = tail_size > 0 ? b + tail_offset : b;
+        ispc::membench_ispc_copy(a_words,
+                                 b_words,
+                                 static_cast<std::int64_t>(word_count),
+                                 a_tail,
+                                 b_tail,
+                                 static_cast<std::int64_t>(tail_size),
+                                 static_cast<std::int32_t>(passes));
+        storeFence();
+
+        const std::uint64_t local_sink =
+            static_cast<std::uint64_t>(a[0]) ^
+            (static_cast<std::uint64_t>(b[slice.size - 1]) << 8U);
+        sink_.fetch_xor(local_sink, std::memory_order_relaxed);
+        doNotOptimize(local_sink);
+#else
+        runCopyMemcpy(slice, passes);
+#endif
     }
 
     void runCopyAvx2Stream(const Slice& slice, std::size_t passes) {

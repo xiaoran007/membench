@@ -108,10 +108,20 @@ private:
     }
 
     ExecutionPlan selectExecutionPlan(TestKind kind) {
+        if (options_.kernel_override_enabled) {
+            ExecutionPlan plan = buildHeuristicPlan(kind);
+            plan.kernel = options_.kernel_override;
+            if (isMetalKernel(plan.kernel)) {
+                plan.selected_threads = 0;
+            }
+            plan.calibrated = false;
+            return plan;
+        }
+
         if (!isCalibrationEnabled()) {
             return buildHeuristicPlan(kind);
         }
-        if (platform_.x86_avx2 && kind == TestKind::Read) {
+        if (platform_.x86_avx2 && kind == TestKind::Read && !hasIspcKernels()) {
             return buildHeuristicPlan(kind);
         }
 

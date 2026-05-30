@@ -12,6 +12,16 @@ bool kernelSupported(const PlatformInfo& platform, KernelKind kernel) {
         case KernelKind::LibcMemset:
         case KernelKind::LibcMemcpy:
             return true;
+        case KernelKind::IspcRead:
+        case KernelKind::IspcWrite:
+        case KernelKind::IspcCopy:
+#ifdef MEMBENCH_HAS_ISPC
+            (void)platform;
+            return true;
+#else
+            (void)platform;
+            return false;
+#endif
         case KernelKind::Avx2Read:
         case KernelKind::Avx2StreamStore:
         case KernelKind::Avx2StreamCopy:
@@ -42,6 +52,14 @@ bool isMetalKernel(KernelKind kernel) {
     return kernel == KernelKind::MetalRead ||
            kernel == KernelKind::MetalWrite ||
            kernel == KernelKind::MetalCopy;
+}
+
+bool hasIspcKernels() {
+#ifdef MEMBENCH_HAS_ISPC
+    return true;
+#else
+    return false;
+#endif
 }
 
 }  // namespace membench

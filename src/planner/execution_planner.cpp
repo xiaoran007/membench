@@ -29,6 +29,9 @@ RunMode chooseDefaultMode(const PlatformInfo& platform) {
 
 double calibrationOverrideRatio(const PlatformInfo& platform, TestKind kind) {
     if (platform.x86_avx2) {
+        if (kind == TestKind::Copy) {
+            return 1.0;
+        }
         return 1.03;
     }
 
@@ -94,6 +97,9 @@ std::vector<KernelKind> buildKernelCandidates(const PlatformInfo& platform,
         case TestKind::Read:
             if (want_cpu) {
                 kernels.push_back(KernelKind::ScalarAuto);
+                if (kernelSupported(platform, KernelKind::IspcRead)) {
+                    kernels.push_back(KernelKind::IspcRead);
+                }
                 if (platform.apple_silicon) {
                     kernels.push_back(KernelKind::NeonPeak);
                 }
@@ -109,6 +115,9 @@ std::vector<KernelKind> buildKernelCandidates(const PlatformInfo& platform,
                 } else {
                     kernels.push_back(KernelKind::LibcMemset);
                 }
+                if (kernelSupported(platform, KernelKind::IspcWrite)) {
+                    kernels.push_back(KernelKind::IspcWrite);
+                }
                 if (platform.apple_silicon) {
                     kernels.push_back(KernelKind::NeonStore);
                 }
@@ -120,6 +129,9 @@ std::vector<KernelKind> buildKernelCandidates(const PlatformInfo& platform,
         case TestKind::Copy:
             if (want_cpu) {
                 kernels.push_back(KernelKind::LibcMemcpy);
+                if (kernelSupported(platform, KernelKind::IspcCopy)) {
+                    kernels.push_back(KernelKind::IspcCopy);
+                }
                 if (!platform.x86_avx2 && kernelSupported(platform, KernelKind::Avx2StreamCopy)) {
                     kernels.push_back(KernelKind::Avx2StreamCopy);
                 }
@@ -154,6 +166,9 @@ KernelKind chooseHeuristicKernel(const PlatformInfo& platform,
             }
             return KernelKind::LibcMemset;
         case TestKind::Copy:
+            if (platform.x86_avx2 && kernelSupported(platform, KernelKind::IspcCopy)) {
+                return KernelKind::IspcCopy;
+            }
             return KernelKind::LibcMemcpy;
     }
     return KernelKind::ScalarAuto;

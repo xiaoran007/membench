@@ -7,6 +7,7 @@ namespace membench {
 
 bool kernelSupported(const PlatformInfo& platform, KernelKind kernel);
 bool isMetalKernel(KernelKind kernel);
+bool hasIspcKernels();
 
 }  // namespace membench
 

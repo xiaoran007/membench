@@ -25,6 +25,7 @@ The benchmark uses:
 - Metal GPU compute shaders for bandwidth testing on Apple Silicon
 - Per-test calibration in peak mode (CPU vs GPU compete)
 - Linux/x86 AVX2 streaming-store kernels for high-throughput write paths
+- Optional ISPC CPU SIMD kernels for read/write/copy
 
 ## Build Requirements
 
@@ -33,6 +34,11 @@ The benchmark uses:
   - Apple Clang 17+ recommended on macOS
   - GCC 7+ or Clang 5+ on Linux
   - MSVC 2017+ on Windows
+- ISPC compiler on Linux is optional
+  - If `ispc` is found, ISPC kernels are built and added to calibration candidates
+  - If `ispc` is missing, CMake prints a warning and builds without ISPC kernels
+  - Configure with `-DMEMBENCH_ENABLE_ISPC=OFF` to skip probing
+  - Optionally pass `-DMEMBENCH_ISPC_TARGET=avx2-i32x8` or another ISPC target
 
 ## Build
 
@@ -48,6 +54,13 @@ Or manually:
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ./build/membench
+```
+
+Linux builds probe for ISPC kernels by default. To skip the probe:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMEMBENCH_ENABLE_ISPC=OFF
+cmake --build build
 ```
 
 ### Windows
@@ -94,6 +107,7 @@ Useful examples:
 - `--thread-policy perf|all`: constrain thread selection
 - `--mode standard|peak`: choose stable or peak-seeking behavior
 - `--backend cpu|metal|auto`: choose CPU-only, Metal GPU, or auto selection
+- `--kernel <name>`: force one kernel for a single selected test
 - `--output auto|tui|plain`: choose the output renderer; `auto` prefers the ANSI TUI
 - `--tui`: alias for `--output tui`
 - `--plain`: alias for `--output plain`
@@ -118,7 +132,7 @@ Useful examples:
 
 On Apple Silicon, peak mode calibrates each test independently and may choose different kernels, thread counts, and backends (CPU or Metal GPU) for `read`, `write`, and `copy`.
 
-On Linux/x86 AVX2 builds, peak mode uses all worker threads for sequential read, calibrates low-thread-count `avx2_stream_store` candidates for write, and calibrates `libc_memcpy` thread counts for copy. Calibration scores candidates by median bandwidth. The streaming-store write kernel avoids write-allocate traffic and can substantially improve large sequential write bandwidth on DDR5 systems.
+On Linux/x86 AVX2 builds, peak mode uses all worker threads for sequential read, calibrates low-thread-count `avx2_stream_store` candidates for write, and calibrates `libc_memcpy` thread counts for copy. When ISPC is enabled, `ispc_read`, `ispc_write`, and `ispc_copy` also participate in peak-mode calibration. Calibration scores candidates by median bandwidth. The streaming-store write kernel avoids write-allocate traffic and can substantially improve large sequential write bandwidth on DDR5 systems.
 
 ## Interpreting Results
 
@@ -155,6 +169,7 @@ The estimated traffic number is only a convenience for comparing with vendor mem
 - Apple Silicon Metal GPU compute shaders for read/write/copy bandwidth testing.
 - In `auto` backend mode, CPU and Metal GPU kernels compete during calibration; the winner is used for the measured run.
 - Linux/x86 AVX2 builds have calibrated CPU peak mode, including AVX2 streaming write/copy candidates.
+- Linux builds can add ISPC CPU SIMD read/write/copy kernels; write/copy use ISPC streaming stores.
 - Linux workers are pinned in a physical-core-first order when CPU topology is available.
 - Windows keeps the portable fallback path.
 

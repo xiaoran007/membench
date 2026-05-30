@@ -90,6 +90,38 @@ bool parseBackend(const std::string& text, Backend* backend) {
     return false;
 }
 
+bool parseKernelKind(const std::string& text, KernelKind* kernel) {
+    if (kernel == nullptr) {
+        return false;
+    }
+
+    const KernelKind kernels[] = {
+        KernelKind::ScalarAuto,
+        KernelKind::NeonPeak,
+        KernelKind::LibcMemset,
+        KernelKind::NeonStore,
+        KernelKind::LibcMemcpy,
+        KernelKind::NeonCopy,
+        KernelKind::Avx2Read,
+        KernelKind::Avx2StreamStore,
+        KernelKind::Avx2StreamCopy,
+        KernelKind::IspcRead,
+        KernelKind::IspcWrite,
+        KernelKind::IspcCopy,
+        KernelKind::MetalRead,
+        KernelKind::MetalWrite,
+        KernelKind::MetalCopy,
+    };
+
+    for (KernelKind candidate : kernels) {
+        if (text == kernelToString(candidate)) {
+            *kernel = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
 bool parseOutputMode(const std::string& text, OutputMode* mode) {
     if (mode == nullptr) {
         return false;
@@ -160,6 +192,30 @@ bool parseTestList(const std::string& text, std::vector<TestKind>* tests) {
     return true;
 }
 
+bool kernelMatchesTest(KernelKind kernel, TestKind kind) {
+    switch (kind) {
+        case TestKind::Read:
+            return kernel == KernelKind::ScalarAuto ||
+                   kernel == KernelKind::NeonPeak ||
+                   kernel == KernelKind::Avx2Read ||
+                   kernel == KernelKind::IspcRead ||
+                   kernel == KernelKind::MetalRead;
+        case TestKind::Write:
+            return kernel == KernelKind::LibcMemset ||
+                   kernel == KernelKind::NeonStore ||
+                   kernel == KernelKind::Avx2StreamStore ||
+                   kernel == KernelKind::IspcWrite ||
+                   kernel == KernelKind::MetalWrite;
+        case TestKind::Copy:
+            return kernel == KernelKind::LibcMemcpy ||
+                   kernel == KernelKind::NeonCopy ||
+                   kernel == KernelKind::Avx2StreamCopy ||
+                   kernel == KernelKind::IspcCopy ||
+                   kernel == KernelKind::MetalCopy;
+    }
+    return false;
+}
+
 void printUsage(const char* program_name, const PlatformInfo& platform) {
     const std::size_t default_size_mb = chooseDefaultBufferSize(platform) / MB;
     const std::string default_mode = runModeToString(chooseDefaultMode(platform));
@@ -177,6 +233,7 @@ void printUsage(const char* program_name, const PlatformInfo& platform) {
               << "  --mode <m>            standard or peak (default: " << default_mode << ")\n"
               << "  --backend <b>         cpu, metal, or auto (default: "
               << (platform.apple_silicon ? "auto" : "cpu") << ")\n"
+              << "  --kernel <name>       Force one kernel for a single selected test\n"
               << "  --output <m>          auto, tui, or plain (default: auto; prefers TUI)\n"
               << "  --tui                 Alias for --output tui\n"
               << "  --plain               Alias for --output plain\n"
@@ -293,6 +350,15 @@ int main(int argc, char* argv[]) {
                 }
                 continue;
             }
+            if (arg == "--kernel") {
+                KernelKind kernel = KernelKind::ScalarAuto;
+                if (!parseKernelKind(requireValue(arg), &kernel)) {
+                    throw std::runtime_error("invalid --kernel value");
+                }
+                options.kernel_override_enabled = true;
+                options.kernel_override = kernel;
+                continue;
+            }
             if (arg == "--output") {
                 if (!parseOutputMode(requireValue(arg), &output_mode)) {
                     throw std::runtime_error("invalid --output value (use auto, tui, or plain)");
@@ -349,6 +415,19 @@ int main(int argc, char* argv[]) {
                 options.calibrate = false;
             }
         } else if (!platform.apple_silicon && !platform.x86_avx2) {
+            options.calibrate = false;
+        }
+
+        if (options.kernel_override_enabled) {
+            if (options.tests.size() != 1) {
+                throw std::runtime_error("--kernel requires exactly one selected test");
+            }
+            if (!kernelMatchesTest(options.kernel_override, options.tests.front())) {
+                throw std::runtime_error("--kernel does not match the selected test");
+            }
+            if (!kernelSupported(platform, options.kernel_override)) {
+                throw std::runtime_error("--kernel is not supported by this build/platform");
+            }
             options.calibrate = false;
         }
     } catch (const std::exception& ex) {

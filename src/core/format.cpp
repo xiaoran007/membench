@@ -66,6 +66,9 @@ std::string kernelToString(KernelKind kernel) {
         case KernelKind::Avx2Read:        return "avx2_read";
         case KernelKind::Avx2StreamStore: return "avx2_stream_store";
         case KernelKind::Avx2StreamCopy:  return "avx2_stream_copy";
+        case KernelKind::IspcRead:        return "ispc_read";
+        case KernelKind::IspcWrite:       return "ispc_write";
+        case KernelKind::IspcCopy:        return "ispc_copy";
         case KernelKind::MetalRead:       return "metal_read";
         case KernelKind::MetalWrite:      return "metal_write";
         case KernelKind::MetalCopy:       return "metal_copy";

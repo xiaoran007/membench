@@ -185,6 +185,7 @@ public:
         if (platform.x86_avx2) {
             std::cout << "x86 AVX2: available\n";
         }
+        std::cout << "ISPC CPU kernels: " << (hasIspcKernels() ? "enabled" : "disabled") << '\n';
         if (!platform.cpu_affinity_order.empty()) {
             std::cout << "CPU affinity order: " << platform.cpu_affinity_order.size()
                       << " logical CPUs, physical cores first\n";
@@ -221,6 +222,9 @@ public:
                   << (!platform.cpu_affinity_order.empty() ? "physical-first" : "disabled")
                   << '\n';
         std::cout << "macOS QoS hint: " << (options.use_qos ? "enabled" : "disabled") << '\n';
+        if (options.kernel_override_enabled) {
+            std::cout << "Kernel override: " << kernelToString(options.kernel_override) << '\n';
+        }
         std::cout << "Tests: ";
         for (std::size_t index = 0; index < options.tests.size(); ++index) {
             if (index > 0) {
@@ -729,6 +733,9 @@ private:
                 "        QoS " + std::string(options_.use_qos ? "enabled" : "disabled") +
                 "        Affinity " +
                 (!platform_.cpu_affinity_order.empty() ? "physical-first" : "disabled"));
+        if (options_.kernel_override_enabled) {
+            boxLine("Kernel override " + kernelToString(options_.kernel_override));
+        }
         if (!allocation_text_.empty()) {
             boxLine(allocation_text_);
         }
