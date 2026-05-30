@@ -650,7 +650,7 @@ private:
 
     void boxTop(const std::string& title = "") const {
         const Theme t = theme();
-        std::string body = t.h + " " + title + " ";
+        std::string body = " " + title + " ";
         const std::size_t visible = title.empty() ? 0 : title.size() + 2;
         if (title.empty()) {
             body.clear();
