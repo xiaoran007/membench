@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace membench {
@@ -62,12 +63,23 @@ enum class KernelKind {
 };
 
 struct PlatformInfo {
+    struct MemoryInfo {
+        std::string technology;
+        std::string device_name;
+        std::string source;
+        std::uint64_t transfer_rate_mt_s = 0;
+        unsigned int aggregate_bus_width_bits = 0;
+        double theoretical_bandwidth_gb_per_sec = 0.0;
+        bool bandwidth_is_published = false;
+    };
+
     std::size_t page_size = 4096;
     std::uint64_t physical_memory_bytes = 0;
     unsigned int hardware_threads = 1;
     unsigned int performance_cores = 0;
     bool apple_silicon = false;
     bool x86_avx2 = false;
+    MemoryInfo memory;
     std::vector<unsigned int> cpu_affinity_order;
 };
 

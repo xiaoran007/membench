@@ -105,6 +105,19 @@ std::vector<unsigned int> detectPhysicalFirstCpuOrder() {
 
 }  // namespace
 
+void finalizeMemoryInfo(PlatformInfo::MemoryInfo* memory) {
+    if (memory == nullptr || memory->bandwidth_is_published) {
+        return;
+    }
+    if (memory->transfer_rate_mt_s == 0 || memory->aggregate_bus_width_bits == 0) {
+        memory->theoretical_bandwidth_gb_per_sec = 0.0;
+        return;
+    }
+    memory->theoretical_bandwidth_gb_per_sec =
+        static_cast<double>(memory->transfer_rate_mt_s) *
+        static_cast<double>(memory->aggregate_bus_width_bits) / 8000.0;
+}
+
 std::vector<unsigned int> parseCpuList(const std::string& text) {
     std::vector<unsigned int> cpus;
     std::stringstream stream(text);

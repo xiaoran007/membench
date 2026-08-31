@@ -20,6 +20,10 @@ std::string formatBytes(std::uint64_t bytes) {
     return oss.str();
 }
 
+double mibPerSecondToGbPerSecond(double mib_per_sec) {
+    return mib_per_sec * static_cast<double>(MB) / 1'000'000'000.0;
+}
+
 std::string testKindToCliName(TestKind kind) {
     switch (kind) {
         case TestKind::Read:  return "read";
