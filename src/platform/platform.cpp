@@ -54,6 +54,8 @@ std::string smbiosMemoryType(std::uint8_t type) {
         case 0x13: return "DDR2";
         case 0x18: return "DDR3";
         case 0x1A: return "DDR4";
+        case 0x1B: return "LPDDR";
+        case 0x1C: return "LPDDR2";
         case 0x1D: return "LPDDR3";
         case 0x1E: return "LPDDR4";
         case 0x1F: return "Logical non-volatile device";
@@ -83,7 +85,7 @@ void detectMemoryFromSmbios(const std::vector<std::uint8_t>& table,
 
         if (type == 17 && length >= 27) {
             const std::uint16_t size = readLe16(table, offset + 12);
-            if (size != 0 && size != 0xFFFFU) {
+            if (size != 0) {
                 ++populated_devices;
                 const std::string technology = smbiosMemoryType(table[offset + 18]);
                 if (memory->technology.empty()) {
@@ -99,11 +101,14 @@ void detectMemoryFromSmbios(const std::vector<std::uint8_t>& table,
                 if (length >= 34) {
                     rate = readLe16(table, offset + 32);
                 }
-                if (rate == 0) {
-                    rate = readLe16(table, offset + 21);
-                }
                 if (rate == 0xFFFFU && length >= 92) {
                     rate = readLe32(table, offset + 88);
+                }
+                if (rate == 0) {
+                    rate = readLe16(table, offset + 21);
+                    if (rate == 0xFFFFU && length >= 88) {
+                        rate = readLe32(table, offset + 84);
+                    }
                 }
                 if (rate == 0xFFFFU) {
                     rate = 0;
