@@ -126,6 +126,22 @@ inline std::string operatingSystemName() {
 #endif
 }
 
+inline std::string memoryDescription(const PlatformInfo::MemoryInfo& memory) {
+    std::ostringstream text;
+    if (!memory.technology.empty()) {
+        text << memory.technology;
+    } else {
+        text << "unknown type";
+    }
+    if (memory.transfer_rate_mt_s > 0) {
+        text << " @ " << memory.transfer_rate_mt_s << " MT/s";
+    }
+    if (memory.aggregate_bus_width_bits > 0) {
+        text << ", " << memory.aggregate_bus_width_bits << "-bit aggregate bus";
+    }
+    return text.str();
+}
+
 class BenchmarkReporter {
 public:
     virtual ~BenchmarkReporter() = default;
@@ -158,6 +174,7 @@ public:
                   const BenchmarkOptions& options) override {
         (void)options;
         setOptions(options);
+        platform_ = platform;
         std::cout << "========================================\n";
         std::cout << "MemBench v" << version << '\n';
         std::cout << "Memory Read/Write/Copy Benchmark\n";
@@ -167,6 +184,17 @@ public:
         std::cout << "Operating System: " << operatingSystemName() << '\n';
         std::cout << "Page size: " << platform.page_size << " bytes\n";
         std::cout << "Physical memory: " << formatBytes(platform.physical_memory_bytes) << '\n';
+        if (!platform.memory.device_name.empty()) {
+            std::cout << "Memory device: " << platform.memory.device_name << '\n';
+        }
+        if (!platform.memory.technology.empty() || platform.memory.transfer_rate_mt_s > 0) {
+            std::cout << "Memory configuration: " << memoryDescription(platform.memory) << '\n';
+        }
+        if (platform.memory.theoretical_bandwidth_gb_per_sec > 0.0) {
+            std::cout << "Theoretical memory bandwidth: " << std::fixed << std::setprecision(2)
+                      << platform.memory.theoretical_bandwidth_gb_per_sec << " GB/s ("
+                      << platform.memory.source << ")\n";
+        }
         std::cout << "Hardware threads: " << platform.hardware_threads << '\n';
         if (platform.apple_silicon) {
             if (platform.performance_cores > 0) {
@@ -257,7 +285,7 @@ public:
             std::cout << ", " << selected.actual_threads << " threads";
         }
         std::cout << " at " << std::fixed << std::setprecision(2)
-                  << (selected.score_mb_per_sec / 1024.0) << " GB/s"
+                  << mibPerSecondToGbPerSecond(selected.score_mb_per_sec) << " GB/s"
                   << "                      \n";
     }
 
@@ -296,10 +324,18 @@ public:
     }
 
     void summary(const std::vector<BenchmarkSummaryEntry>& entries) override {
-        if (entries.size() <= 1) {
-            return;
-        }
         std::cout << "=== Summary ===\n";
+        if (platform_.memory.theoretical_bandwidth_gb_per_sec > 0.0) {
+            std::cout << "  Theoretical peak: " << std::fixed << std::setprecision(2)
+                      << platform_.memory.theoretical_bandwidth_gb_per_sec << " GB/s ("
+                      << platform_.memory.source << ")\n";
+        } else {
+            std::cout << "  Theoretical peak: unavailable";
+            if (platform_.memory.transfer_rate_mt_s > 0) {
+                std::cout << " (aggregate bus width was not detected)";
+            }
+            std::cout << '\n';
+        }
         for (const auto& e : entries) {
             std::ostringstream line;
             line << std::fixed << std::setprecision(2);
@@ -309,6 +345,14 @@ public:
                      << e.avg_traffic_gb_per_sec << " GB/s traffic";
             } else {
                 line << e.avg_bandwidth_gb_per_sec << " GB/s";
+            }
+            if (platform_.memory.theoretical_bandwidth_gb_per_sec > 0.0) {
+                const double comparable = e.kind == TestKind::Copy
+                                              ? e.avg_traffic_gb_per_sec
+                                              : e.avg_bandwidth_gb_per_sec;
+                line << ", " << (comparable * 100.0 /
+                                  platform_.memory.theoretical_bandwidth_gb_per_sec)
+                     << "% of theoretical";
             }
             line << "  (" << kernelToString(e.plan.kernel);
             if (isMetalKernel(e.plan.kernel)) {
@@ -337,22 +381,23 @@ public:
 private:
     void printBandwidthStats(const std::string& prefix, const Statistics& stats) const {
         std::cout << std::setprecision(2);
-        std::cout << prefix << "avg bandwidth: " << (stats.average / 1024.0) << " GB/s ("
-                  << stats.average << " MB/s)\n";
-        std::cout << prefix << "median bandwidth: " << (stats.median / 1024.0) << " GB/s ("
-                  << stats.median << " MB/s)\n";
-        std::cout << prefix << "min bandwidth: " << (stats.minimum / 1024.0) << " GB/s ("
-                  << stats.minimum << " MB/s)\n";
-        std::cout << prefix << "max bandwidth: " << (stats.maximum / 1024.0) << " GB/s ("
-                  << stats.maximum << " MB/s)\n";
-        std::cout << prefix << "stdev bandwidth: " << (stats.stdev / 1024.0) << " GB/s ("
-                  << stats.stdev << " MB/s)\n";
+        std::cout << prefix << "avg bandwidth: " << mibPerSecondToGbPerSecond(stats.average) << " GB/s ("
+                  << stats.average << " MiB/s)\n";
+        std::cout << prefix << "median bandwidth: " << mibPerSecondToGbPerSecond(stats.median) << " GB/s ("
+                  << stats.median << " MiB/s)\n";
+        std::cout << prefix << "min bandwidth: " << mibPerSecondToGbPerSecond(stats.minimum) << " GB/s ("
+                  << stats.minimum << " MiB/s)\n";
+        std::cout << prefix << "max bandwidth: " << mibPerSecondToGbPerSecond(stats.maximum) << " GB/s ("
+                  << stats.maximum << " MiB/s)\n";
+        std::cout << prefix << "stdev bandwidth: " << mibPerSecondToGbPerSecond(stats.stdev) << " GB/s ("
+                  << stats.stdev << " MiB/s)\n";
     }
 
     RunMode options_mode_ = RunMode::Standard;
     std::size_t options_size_bytes_ = 0;
     std::size_t options_warmup_iterations_ = 0;
     std::size_t options_measured_iterations_ = 0;
+    PlatformInfo platform_;
 };
 
 class TuiReporter final : public BenchmarkReporter {
@@ -420,7 +465,7 @@ public:
         state.progress_total = progress.total;
         state.best_kernel = progress.best_kernel;
         state.best_threads = progress.best_threads;
-        state.best_gb_per_sec = progress.best_score_mb_per_sec / 1024.0;
+        state.best_gb_per_sec = mibPerSecondToGbPerSecond(progress.best_score_mb_per_sec);
         focused_test_ = progress.kind;
         focused_title_ = testKindToTitle(progress.kind);
         focused_detail_ = "current " + kernelToString(progress.kernel) +
@@ -434,7 +479,7 @@ public:
         state.threads = selected.actual_threads;
         state.best_kernel = selected.kernel;
         state.best_threads = selected.actual_threads;
-        state.best_gb_per_sec = selected.score_mb_per_sec / 1024.0;
+        state.best_gb_per_sec = mibPerSecondToGbPerSecond(selected.score_mb_per_sec);
         state.status = "selected";
         focused_test_ = kind;
         focused_title_ = testKindToTitle(kind);
@@ -733,6 +778,10 @@ private:
                 "        QoS " + std::string(options_.use_qos ? "enabled" : "disabled") +
                 "        Affinity " +
                 (!platform_.cpu_affinity_order.empty() ? "physical-first" : "disabled"));
+        if (!platform_.memory.technology.empty() ||
+            platform_.memory.transfer_rate_mt_s > 0) {
+            boxLine("Memory " + memoryDescription(platform_.memory));
+        }
         if (options_.kernel_override_enabled) {
             boxLine("Kernel override " + kernelToString(options_.kernel_override));
         }
@@ -780,8 +829,10 @@ private:
                  threadText(state.best_kernel, state.best_threads) +
                  ", " + fixed(state.best_gb_per_sec, 2) + " GB/s");
         } else if (state.has_result) {
-            line("  median " + fixed(state.result.bandwidth_mb_per_sec.median / 1024.0, 2) +
-                 " GB/s   best " + fixed(state.result.bandwidth_mb_per_sec.maximum / 1024.0, 2) +
+            line("  median " +
+                 fixed(mibPerSecondToGbPerSecond(state.result.bandwidth_mb_per_sec.median), 2) +
+                 " GB/s   best " +
+                 fixed(mibPerSecondToGbPerSecond(state.result.bandwidth_mb_per_sec.maximum), 2) +
                  " GB/s");
         } else {
             line("  waiting for first sample");
@@ -815,9 +866,9 @@ private:
             boxLine(truncate(testLabel(kind), 8) + "-");
             return;
         }
-        const double avg = state.result.bandwidth_mb_per_sec.average / 1024.0;
-        const double median = state.result.bandwidth_mb_per_sec.median / 1024.0;
-        const double best = state.result.bandwidth_mb_per_sec.maximum / 1024.0;
+        const double avg = mibPerSecondToGbPerSecond(state.result.bandwidth_mb_per_sec.average);
+        const double median = mibPerSecondToGbPerSecond(state.result.bandwidth_mb_per_sec.median);
+        const double best = mibPerSecondToGbPerSecond(state.result.bandwidth_mb_per_sec.maximum);
         boxLine(truncate(testLabel(kind), 8) +
                 "avg " + fixed(avg, 2) + " GB/s   median " +
                 fixed(median, 2) + " GB/s   best " + fixed(best, 2) + " GB/s");
@@ -830,8 +881,8 @@ private:
                     truncate("pending", 13) + truncate("-", 15) + truncate("-", 10) + "-");
             return;
         }
-        const double avg = state.result.bandwidth_mb_per_sec.average / 1024.0;
-        const double median = state.result.bandwidth_mb_per_sec.median / 1024.0;
+        const double avg = mibPerSecondToGbPerSecond(state.result.bandwidth_mb_per_sec.average);
+        const double median = mibPerSecondToGbPerSecond(state.result.bandwidth_mb_per_sec.median);
         const std::string threads = isMetalKernel(state.plan.kernel)
                                         ? "gpu"
                                         : std::to_string(state.actual_threads);
@@ -843,7 +894,9 @@ private:
                 (state.plan.calibrated ? "calibrated" : "-"));
         if (kind == TestKind::Copy) {
             boxLine("        traffic estimate " +
-                    fixed((state.result.bandwidth_mb_per_sec.average * 2.0) / 1024.0, 2) +
+                    fixed(mibPerSecondToGbPerSecond(
+                              state.result.bandwidth_mb_per_sec.average * 2.0),
+                          2) +
                     " GB/s");
         }
     }
@@ -853,6 +906,13 @@ private:
             return;
         }
         line(color("1;36", "Summary"));
+        if (platform_.memory.theoretical_bandwidth_gb_per_sec > 0.0) {
+            line("  Theoretical peak: " +
+                 fixed(platform_.memory.theoretical_bandwidth_gb_per_sec, 2) + " GB/s (" +
+                 platform_.memory.source + ")");
+        } else {
+            line("  Theoretical peak: unavailable");
+        }
         for (const auto& entry : summary_) {
             std::ostringstream oss;
             oss << "  " << testKindToTitle(entry.kind) << ": ";
@@ -861,6 +921,16 @@ private:
                     << fixed(entry.avg_traffic_gb_per_sec, 2) << " GB/s traffic";
             } else {
                 oss << fixed(entry.avg_bandwidth_gb_per_sec, 2) << " GB/s";
+            }
+            if (platform_.memory.theoretical_bandwidth_gb_per_sec > 0.0) {
+                const double comparable = entry.kind == TestKind::Copy
+                                              ? entry.avg_traffic_gb_per_sec
+                                              : entry.avg_bandwidth_gb_per_sec;
+                oss << ", "
+                    << fixed(comparable * 100.0 /
+                                 platform_.memory.theoretical_bandwidth_gb_per_sec,
+                             1)
+                    << "% of theoretical";
             }
             oss << "  (" << kernelToString(entry.plan.kernel);
             if (isMetalKernel(entry.plan.kernel)) {

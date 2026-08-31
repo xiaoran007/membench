@@ -228,7 +228,8 @@ double applePublishedBandwidth(const std::string& chip, unsigned int gpu_cores) 
 
 void detectAppleMemory(PlatformInfo::MemoryInfo* memory) {
     const std::string profile = commandOutput(
-        "/usr/sbin/system_profiler SPHardwareDataType SPMemoryDataType SPDisplaysDataType 2>/dev/null");
+        "LC_ALL=C /usr/sbin/system_profiler SPHardwareDataType SPMemoryDataType "
+        "SPDisplaysDataType 2>/dev/null");
     const std::size_t memory_section = profile.find("Memory:");
     const std::size_t graphics_section = profile.find("Graphics/Displays:");
     memory->device_name = labeledValue(profile, "Chip:");
