@@ -112,6 +112,8 @@ Useful examples:
 - `--tui`: alias for `--output tui`
 - `--plain`: alias for `--output plain`
 - `--tui-style auto|unicode|ascii`: choose the TUI border/progress style
+- `--memory-rate-mts <n>`: override the effective memory transfer rate in MT/s
+- `--memory-bus-width-bits <n>`: override the aggregate memory bus width in bits
 - `--no-calibrate`: disable peak-mode calibration
 - `--no-qos`: disable macOS QoS hints
 - `--help`: print usage
@@ -149,12 +151,41 @@ Each test prints:
 - `measured_elapsed_ms`
 - `avg / median / min / max / stdev bandwidth`
 
+The final summary also prints the theoretical peak memory bandwidth when enough platform
+information is available, together with each result as a percentage of that peak. MemBench uses
+decimal `GB/s` for both measured and theoretical values; the parenthesized detailed values use
+binary `MiB/s`.
+
+The derived theoretical peak is:
+
+```text
+effective transfer rate (MT/s) * aggregate bus width (bits) / 8 / 1000
+```
+
+On Apple Silicon, MemBench reads the chip, memory type, and GPU-core variant from
+`system_profiler` and uses Apple's published unified-memory bandwidth for that exact chip variant.
+On Linux, it reads SMBIOS memory-device records directly from
+`/sys/firmware/dmi/tables/DMI`. On Windows, it reads the same SMBIOS records through the firmware
+table API. SMBIOS describes individual memory devices but usually does not expose the active
+channel topology, so MemBench only derives the aggregate width automatically when one populated
+memory device is present. It does not assume that DIMM count equals channel count.
+
+When automatic detection cannot establish the aggregate bus width, provide both
+`--memory-rate-mts` and `--memory-bus-width-bits`. For example, a dual-channel DDR5-6000 system
+with a 128-bit aggregate interface can be described as:
+
+```bash
+./build/membench --memory-rate-mts 6000 --memory-bus-width-bits 128
+```
+
 For `copy`, MemBench prints two bandwidth views:
 
 - `logical ... bandwidth`: logical memcpy throughput
 - `estimated traffic ... bandwidth`: logical throughput multiplied by 2
 
 The estimated traffic number is only a convenience for comparing with vendor memory-bandwidth figures. It is not a hardware counter measurement.
+The summary compares this estimated traffic value, rather than logical memcpy throughput, with
+the theoretical peak. Read and write compare their logical throughput directly.
 
 ## Notes On Accuracy
 
