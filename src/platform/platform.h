@@ -11,6 +11,7 @@ namespace membench {
 
 std::vector<unsigned int> parseCpuList(const std::string& text);
 PlatformInfo detectPlatformInfo();
+void finalizeMemoryInfo(PlatformInfo::MemoryInfo* memory);
 std::uint64_t monotonicNowNs();
 void applyCurrentThreadPolicy(RunMode mode, bool use_qos);
 void applyCurrentThreadAffinity(const std::vector<unsigned int>& cpu_affinity_order,

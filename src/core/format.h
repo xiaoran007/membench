@@ -9,6 +9,7 @@
 namespace membench {
 
 std::string formatBytes(std::uint64_t bytes);
+double mibPerSecondToGbPerSecond(double mib_per_sec);
 std::string testKindToCliName(TestKind kind);
 std::string testKindToTitle(TestKind kind);
 std::string threadPolicyToString(ThreadPolicy policy);

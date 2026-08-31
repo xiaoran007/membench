@@ -238,6 +238,8 @@ void printUsage(const char* program_name, const PlatformInfo& platform) {
               << "  --tui                 Alias for --output tui\n"
               << "  --plain               Alias for --output plain\n"
               << "  --tui-style <s>       auto, unicode, or ascii (default: auto; prefers unicode)\n"
+              << "  --memory-rate-mts <n> Override effective memory transfer rate in MT/s\n"
+              << "  --memory-bus-width-bits <n> Override aggregate memory bus width in bits\n"
               << "  --no-calibrate        Disable peak-mode kernel/thread calibration\n"
               << "  --no-qos              Disable macOS QoS hinting\n"
               << "  --help                Show this message\n\n"
@@ -252,7 +254,7 @@ void printUsage(const char* program_name, const PlatformInfo& platform) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
-    const PlatformInfo platform = detectPlatformInfo();
+    PlatformInfo platform = detectPlatformInfo();
 
     BenchmarkOptions options;
     options.size_bytes = chooseDefaultBufferSize(platform);
@@ -274,6 +276,8 @@ int main(int argc, char* argv[]) {
     bool positional_size_consumed = false;
     bool mode_explicit = false;
     bool thread_policy_explicit = false;
+    std::uint64_t memory_rate_override = 0;
+    std::uint64_t memory_bus_width_override = 0;
 
     try {
         for (int index = 1; index < argc; ++index) {
@@ -379,6 +383,21 @@ int main(int argc, char* argv[]) {
                 }
                 continue;
             }
+            if (arg == "--memory-rate-mts") {
+                if (!parseUnsigned64(requireValue(arg), &memory_rate_override) ||
+                    memory_rate_override == 0) {
+                    throw std::runtime_error("invalid --memory-rate-mts value");
+                }
+                continue;
+            }
+            if (arg == "--memory-bus-width-bits") {
+                if (!parseUnsigned64(requireValue(arg), &memory_bus_width_override) ||
+                    memory_bus_width_override == 0 ||
+                    memory_bus_width_override > std::numeric_limits<unsigned int>::max()) {
+                    throw std::runtime_error("invalid --memory-bus-width-bits value");
+                }
+                continue;
+            }
             if (arg == "--no-calibrate") {
                 options.calibrate = false;
                 continue;
@@ -429,6 +448,18 @@ int main(int argc, char* argv[]) {
                 throw std::runtime_error("--kernel is not supported by this build/platform");
             }
             options.calibrate = false;
+        }
+        if ((memory_rate_override == 0) != (memory_bus_width_override == 0)) {
+            throw std::runtime_error(
+                "--memory-rate-mts and --memory-bus-width-bits must be provided together");
+        }
+        if (memory_rate_override > 0) {
+            platform.memory.transfer_rate_mt_s = memory_rate_override;
+            platform.memory.aggregate_bus_width_bits =
+                static_cast<unsigned int>(memory_bus_width_override);
+            platform.memory.bandwidth_is_published = false;
+            platform.memory.source = "command-line override";
+            finalizeMemoryInfo(&platform.memory);
         }
     } catch (const std::exception& ex) {
         std::cerr << "Error: " << ex.what() << '\n';

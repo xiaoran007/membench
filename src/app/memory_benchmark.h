@@ -354,7 +354,8 @@ private:
         entry.kind = kind;
         entry.plan = plan;
         entry.actual_threads = actual_threads;
-        entry.avg_bandwidth_gb_per_sec = result.bandwidth_mb_per_sec.average / 1024.0;
+        entry.avg_bandwidth_gb_per_sec =
+            mibPerSecondToGbPerSecond(result.bandwidth_mb_per_sec.average);
         entry.avg_traffic_gb_per_sec =
             (kind == TestKind::Copy) ? entry.avg_bandwidth_gb_per_sec * 2.0 : 0.0;
         return entry;
