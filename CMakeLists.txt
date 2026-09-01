@@ -35,6 +35,7 @@ set(MEMBENCH_SOURCES
     src/core/statistics.cpp
     src/kernels/kernel_registry.cpp
     src/memory/aligned_buffer.cpp
+    src/platform/memory_probe.cpp
     src/platform/platform.cpp
     src/planner/execution_planner.cpp
 )
@@ -151,6 +152,7 @@ add_executable(membench_unit_tests
     tests/unit_tests.cpp
     src/core/format.cpp
     src/core/statistics.cpp
+    src/platform/memory_probe.cpp
     src/platform/platform.cpp
     src/planner/execution_planner.cpp
     src/kernels/kernel_registry.cpp

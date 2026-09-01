@@ -1,12 +1,12 @@
 #include "platform/platform.h"
 
 #include "core/types.h"
+#include "platform/memory_probe.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <fstream>
-#include <iterator>
 #include <limits>
 #include <sstream>
 #include <thread>
@@ -34,125 +34,6 @@
 
 namespace membench {
 namespace {
-
-#if defined(_WIN32) || defined(__linux__)
-std::uint16_t readLe16(const std::vector<std::uint8_t>& data, std::size_t offset) {
-    return static_cast<std::uint16_t>(data[offset]) |
-           (static_cast<std::uint16_t>(data[offset + 1]) << 8U);
-}
-
-std::uint32_t readLe32(const std::vector<std::uint8_t>& data, std::size_t offset) {
-    return static_cast<std::uint32_t>(data[offset]) |
-           (static_cast<std::uint32_t>(data[offset + 1]) << 8U) |
-           (static_cast<std::uint32_t>(data[offset + 2]) << 16U) |
-           (static_cast<std::uint32_t>(data[offset + 3]) << 24U);
-}
-
-std::string smbiosMemoryType(std::uint8_t type) {
-    switch (type) {
-        case 0x12: return "DDR";
-        case 0x13: return "DDR2";
-        case 0x18: return "DDR3";
-        case 0x1A: return "DDR4";
-        case 0x1B: return "LPDDR";
-        case 0x1C: return "LPDDR2";
-        case 0x1D: return "LPDDR3";
-        case 0x1E: return "LPDDR4";
-        case 0x1F: return "Logical non-volatile device";
-        case 0x22: return "DDR5";
-        case 0x23: return "LPDDR5";
-        default: return {};
-    }
-}
-
-void detectMemoryFromSmbios(const std::vector<std::uint8_t>& table,
-                            PlatformInfo::MemoryInfo* memory) {
-    if (memory == nullptr) {
-        return;
-    }
-
-    std::size_t populated_devices = 0;
-    unsigned int single_device_width = 0;
-    std::uint64_t common_rate = 0;
-    bool rates_match = true;
-    std::size_t offset = 0;
-    while (offset + 4 <= table.size()) {
-        const std::uint8_t type = table[offset];
-        const std::size_t length = table[offset + 1];
-        if (length < 4 || offset + length > table.size()) {
-            break;
-        }
-
-        if (type == 17 && length >= 27) {
-            const std::uint16_t size = readLe16(table, offset + 12);
-            if (size != 0) {
-                ++populated_devices;
-                const std::string technology = smbiosMemoryType(table[offset + 18]);
-                if (memory->technology.empty()) {
-                    memory->technology = technology;
-                } else if (!technology.empty() && memory->technology != technology) {
-                    memory->technology = "mixed";
-                }
-
-                const std::uint16_t width = readLe16(table, offset + 10);
-                single_device_width = width == 0xFFFFU ? 0 : width;
-
-                std::uint64_t rate = 0;
-                if (length >= 34) {
-                    rate = readLe16(table, offset + 32);
-                }
-                if (rate == 0xFFFFU && length >= 92) {
-                    rate = readLe32(table, offset + 88);
-                }
-                if (rate == 0) {
-                    rate = readLe16(table, offset + 21);
-                    if (rate == 0xFFFFU && length >= 88) {
-                        rate = readLe32(table, offset + 84);
-                    }
-                }
-                if (rate == 0xFFFFU) {
-                    rate = 0;
-                }
-                if (rate > 0) {
-                    if (common_rate == 0) {
-                        common_rate = rate;
-                    } else if (common_rate != rate) {
-                        rates_match = false;
-                    }
-                }
-            }
-        }
-
-        std::size_t next = offset + length;
-        while (next + 1 < table.size() && (table[next] != 0 || table[next + 1] != 0)) {
-            ++next;
-        }
-        offset = next + 2;
-        if (type == 127) {
-            break;
-        }
-    }
-
-    memory->transfer_rate_mt_s = rates_match ? common_rate : 0;
-    if (populated_devices == 1) {
-        memory->aggregate_bus_width_bits = single_device_width;
-    }
-    if (populated_devices > 0) {
-        memory->source = "SMBIOS";
-    }
-    finalizeMemoryInfo(memory);
-}
-#endif
-
-#ifdef __linux__
-std::vector<std::uint8_t> readBinaryFile(const std::string& path) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) {
-        return {};
-    }
-    return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
-}
-#endif
 
 #ifdef __APPLE__
 std::string commandOutput(const char* command) {
@@ -255,24 +136,6 @@ void detectAppleMemory(PlatformInfo::MemoryInfo* memory) {
     } else if (!memory->technology.empty() || memory->transfer_rate_mt_s > 0) {
         memory->source = "system_profiler";
     }
-}
-#endif
-
-#ifdef _WIN32
-std::vector<std::uint8_t> readWindowsSmbiosTable() {
-    const DWORD size = GetSystemFirmwareTable('RSMB', 0, nullptr, 0);
-    if (size <= 8) {
-        return {};
-    }
-    std::vector<std::uint8_t> raw(size);
-    if (GetSystemFirmwareTable('RSMB', 0, raw.data(), size) != size) {
-        return {};
-    }
-    const std::uint32_t table_size = readLe32(raw, 4);
-    if (table_size > size - 8) {
-        return {};
-    }
-    return {raw.begin() + 8, raw.begin() + 8 + table_size};
 }
 #endif
 
@@ -404,7 +267,7 @@ PlatformInfo detectPlatformInfo() {
     if (GlobalMemoryStatusEx(&memory_status)) {
         info.physical_memory_bytes = memory_status.ullTotalPhys;
     }
-    detectMemoryFromSmbios(readWindowsSmbiosTable(), &info.memory);
+    info.memory = probeSystemSmbiosMemory().memory;
 #else
     const long page_size = sysconf(_SC_PAGESIZE);
     info.page_size = page_size > 0 ? static_cast<std::size_t>(page_size) : 4096;
@@ -444,7 +307,7 @@ PlatformInfo detectPlatformInfo() {
 #endif
 
 #ifdef __linux__
-    detectMemoryFromSmbios(readBinaryFile("/sys/firmware/dmi/tables/DMI"), &info.memory);
+    info.memory = probeSystemSmbiosMemory().memory;
 #endif
 #endif
 #endif
