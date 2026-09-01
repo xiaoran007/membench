@@ -46,6 +46,24 @@ target_include_directories(membench PRIVATE
     ${PROJECT_SOURCE_DIR}/src
 )
 
+add_executable(membench_memory_probe EXCLUDE_FROM_ALL
+    src/tools/memory_probe.cpp
+    src/platform/memory_probe.cpp
+)
+target_include_directories(membench_memory_probe PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+if(WIN32)
+    target_compile_definitions(membench_memory_probe PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+if(MSVC)
+    target_compile_definitions(membench_memory_probe PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(membench_memory_probe PRIVATE /W4 "$<$<NOT:$<CONFIG:Debug>>:/O2>")
+else()
+    target_compile_options(membench_memory_probe PRIVATE
+        -Wall -Wextra "$<$<NOT:$<CONFIG:Debug>>:-O3>"
+    )
+endif()
+
 if(MEMBENCH_ENABLE_ISPC)
     find_program(ISPC_EXECUTABLE ispc)
     if(NOT ISPC_EXECUTABLE)
