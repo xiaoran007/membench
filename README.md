@@ -63,6 +63,35 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMEMBENCH_ENABLE_ISPC=OFF
 cmake --build build
 ```
 
+### Standalone Memory Probe
+
+Build the SMBIOS memory reader without building or running the benchmark:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target membench_memory_probe
+./build/membench_memory_probe
+```
+
+The probe reports the system input path, read and parse status, byte and structure counts, every
+SMBIOS Type 17 memory-device record, and the exact reason that a common transfer rate or aggregate
+bus width could not be established. Its exit codes are:
+
+- `0`: the input was parsed and a theoretical peak was calculated
+- `1`: the input could not be read or parsed
+- `2`: the input was parsed, but the information was insufficient for a theoretical peak
+
+To reproduce a result away from the original Linux machine, copy its raw DMI table and parse the
+captured file on any supported build host:
+
+```bash
+sudo cp /sys/firmware/dmi/tables/DMI ./dmi.bin
+./build/membench_memory_probe --smbios-file ./dmi.bin
+```
+
+The raw table may require elevated permission to copy. The probe itself does not request elevated
+permission or invoke `dmidecode`.
+
 ### Windows
 
 ```cmd
