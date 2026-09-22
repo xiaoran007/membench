@@ -35,6 +35,7 @@ set(MEMBENCH_SOURCES
     src/core/statistics.cpp
     src/kernels/kernel_registry.cpp
     src/memory/aligned_buffer.cpp
+    src/platform/memory_probe.cpp
     src/platform/platform.cpp
     src/planner/execution_planner.cpp
 )
@@ -44,6 +45,24 @@ target_include_directories(membench PRIVATE
     ${PROJECT_BINARY_DIR}
     ${PROJECT_SOURCE_DIR}/src
 )
+
+add_executable(membench_memory_probe EXCLUDE_FROM_ALL
+    src/tools/memory_probe.cpp
+    src/platform/memory_probe.cpp
+)
+target_include_directories(membench_memory_probe PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+if(WIN32)
+    target_compile_definitions(membench_memory_probe PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+if(MSVC)
+    target_compile_definitions(membench_memory_probe PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(membench_memory_probe PRIVATE /W4 "$<$<NOT:$<CONFIG:Debug>>:/O2>")
+else()
+    target_compile_options(membench_memory_probe PRIVATE
+        -Wall -Wextra "$<$<NOT:$<CONFIG:Debug>>:-O3>"
+    )
+endif()
 
 if(MEMBENCH_ENABLE_ISPC)
     find_program(ISPC_EXECUTABLE ispc)
@@ -128,8 +147,9 @@ if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
     message(STATUS "Metal GPU backend enabled (runtime shader compilation)")
     # -------------------------------------------------------------------------
 
-elseif((CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|i.86") OR
-        (CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|i.86"))
+elseif(NOT CMAKE_CROSSCOMPILING AND
+       ((CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|i.86") OR
+        (CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|i.86")))
     check_cxx_compiler_flag("-march=native" COMPILER_SUPPORTS_MARCH_NATIVE)
     if(COMPILER_SUPPORTS_MARCH_NATIVE)
         target_compile_options(membench PRIVATE -march=native)
@@ -151,6 +171,7 @@ add_executable(membench_unit_tests
     tests/unit_tests.cpp
     src/core/format.cpp
     src/core/statistics.cpp
+    src/platform/memory_probe.cpp
     src/platform/platform.cpp
     src/planner/execution_planner.cpp
     src/kernels/kernel_registry.cpp

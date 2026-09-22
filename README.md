@@ -33,7 +33,9 @@ The benchmark uses:
 - A C++17 compiler
   - Apple Clang 17+ recommended on macOS
   - GCC 7+ or Clang 5+ on Linux
-  - MSVC 2017+ on Windows
+  - MSVC 2017+ for native Windows builds
+- Alternatively, Docker Desktop in Linux containers mode for Windows x64 builds;
+  no host CMake, compiler, or Windows SDK is needed
 - ISPC compiler on Linux is optional
   - If `ispc` is found, ISPC kernels are built and added to calibration candidates
   - If `ispc` is missing, CMake prints a warning and builds without ISPC kernels
@@ -63,7 +65,84 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMEMBENCH_ENABLE_ISPC=OFF
 cmake --build build
 ```
 
+### Standalone Memory Probe
+
+Build the SMBIOS memory reader without building or running the benchmark:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target membench_memory_probe
+./build/membench_memory_probe
+```
+
+The probe reports the system input path, read and parse status, byte and structure counts, every
+SMBIOS Type 17 memory-device record, and the exact reason that a common transfer rate or aggregate
+bus width could not be established. Its exit codes are:
+
+- `0`: the input was parsed and a theoretical peak was calculated
+- `1`: the input could not be read or parsed
+- `2`: the input was parsed, but the information was insufficient for a theoretical peak
+
+To reproduce a result away from the original Linux machine, copy its raw DMI table and parse the
+captured file on any supported build host:
+
+```bash
+sudo cp /sys/firmware/dmi/tables/DMI ./dmi.bin
+./build/membench_memory_probe --smbios-file ./dmi.bin
+```
+
+The raw table may require elevated permission to copy. The probe itself does not request elevated
+permission or invoke `dmidecode`.
+
 ### Windows
+
+#### Docker (no Windows build toolchain required)
+
+Start Docker Desktop with **Linux containers** enabled, then run from Command Prompt:
+
+```cmd
+build-docker.bat
+```
+
+From PowerShell, use `./build-docker.bat`. The script works from any working
+directory and exports these files into the repository's existing Windows output path:
+
+```text
+build/Release/membench.exe
+build/Release/membench_memory_probe.exe
+```
+
+Run the benchmark directly on Windows:
+
+```cmd
+.\build\Release\membench.exe
+```
+
+The Linux build container uses Debian and MinGW-w64 to cross-compile Windows x64
+binaries. Compiler and thread runtimes are statically linked, so no separate
+MinGW DLLs are needed. The first build downloads the container image and build
+dependencies; later builds reuse Docker's cache. Docker displays build progress
+and the script returns a nonzero exit code if the build or export fails.
+
+The same build is available from Linux or macOS, using Linux containers:
+
+```bash
+docker build --file docker/windows.Dockerfile --output type=local,dest=build/Release --progress=plain .
+```
+
+The container runs on the builder's architecture and always targets Windows x64.
+It uses baseline x86-64 instructions rather than the build machine's native CPU
+features, with ISPC disabled. Compilation stays inside Docker; only the two
+executables are exported, overwriting those files if present. Run performance
+measurements on the Windows machine being measured.
+
+Windows CI artifacts are built with this Dockerfile on an Ubuntu runner and
+uploaded as `membench-windows-x64`. A subsequent Windows runner downloads these
+artifacts and runs `membench.exe 512` to check the cross-compiled executable.
+
+#### Native Windows toolchain
+
+With CMake and MSVC installed:
 
 ```cmd
 build.bat
