@@ -147,8 +147,9 @@ if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
     message(STATUS "Metal GPU backend enabled (runtime shader compilation)")
     # -------------------------------------------------------------------------
 
-elseif((CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|i.86") OR
-        (CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|i.86"))
+elseif(NOT CMAKE_CROSSCOMPILING AND
+       ((CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|i.86") OR
+        (CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|i.86")))
     check_cxx_compiler_flag("-march=native" COMPILER_SUPPORTS_MARCH_NATIVE)
     if(COMPILER_SUPPORTS_MARCH_NATIVE)
         target_compile_options(membench PRIVATE -march=native)
