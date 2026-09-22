@@ -60,3 +60,19 @@ jobs:
           build/Release/membench.exe
           build/Release/membench_memory_probe.exe
         if-no-files-found: error
+
+  windows-run:
+    needs: windows
+    runs-on: windows-latest
+    steps:
+    - name: Download Windows artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: membench-windows-x64
+        path: build/Release
+
+    - name: Test run (Windows)
+      shell: pwsh
+      run: |
+        .\build\Release\membench.exe 512
+        exit $LASTEXITCODE

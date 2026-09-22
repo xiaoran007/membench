@@ -137,7 +137,8 @@ executables are exported, overwriting those files if present. Run performance
 measurements on the Windows machine being measured.
 
 Windows CI artifacts are built with this Dockerfile on an Ubuntu runner and
-uploaded as `membench-windows-x64`. This cross-build does not run Windows binaries.
+uploaded as `membench-windows-x64`. A subsequent Windows runner downloads these
+artifacts and runs `membench.exe 512` to check the cross-compiled executable.
 
 #### Native Windows toolchain
 
