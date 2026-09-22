@@ -10,7 +10,7 @@ jobs:
   build:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
         
     runs-on: ${{ matrix.os }}
     
@@ -35,18 +35,28 @@ jobs:
       run: cmake --build build --config Release
     
     - name: Test run (Linux/macOS)
-      if: runner.os != 'Windows'
       run: ./build/membench 512
-      
-    - name: Test run (Windows)
-      if: runner.os == 'Windows'
-      run: .\build\Release\membench.exe 512
     
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
         name: membench-${{ matrix.os }}
-        path: |
-          build/membench
-          build/Release/membench.exe
+        path: build/membench
         if-no-files-found: ignore
+
+  windows:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Cross-compile Windows x64 with Docker
+      run: docker build --file docker/windows.Dockerfile --output type=local,dest=build/Release --progress=plain .
+
+    - name: Upload Windows artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: membench-windows-x64
+        path: |
+          build/Release/membench.exe
+          build/Release/membench_memory_probe.exe
+        if-no-files-found: error
